@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
@@ -12,6 +13,7 @@ from olmocr.pipeline import (
     DetectedFigureRef,
     LayoutDetection,
     PageResult,
+    _load_layout_detector_model,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
     _rewrite_markdown_with_detected_refs,
@@ -62,6 +64,28 @@ def base64_to_image(base64_str):
     """Convert base64 string to PIL Image."""
     image_bytes = base64.b64decode(base64_str)
     return Image.open(BytesIO(image_bytes))
+
+
+class TestFigureLayoutDetectorLoading:
+    def test_load_layout_detector_model_filters_known_meta_parameter_warning(self):
+        class DummyLoader:
+            @staticmethod
+            def from_pretrained(model_name):
+                warnings.warn_explicit(
+                    "for conv1.weight: copying from a non-meta parameter in the checkpoint to a meta parameter in the current model, which is a no-op.",
+                    UserWarning,
+                    filename="ignored.py",
+                    lineno=1,
+                    module="torch.nn.modules.module",
+                )
+                return {"model_name": model_name}
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loaded = _load_layout_detector_model(DummyLoader, "dummy-layout-model")
+
+        assert loaded == {"model_name": "dummy-layout-model"}
+        assert caught == []
 
 
 class TestImageRotation:

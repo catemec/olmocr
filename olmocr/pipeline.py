@@ -16,6 +16,7 @@ import ssl
 import sys
 import tarfile
 import tempfile
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cache
@@ -684,6 +685,17 @@ def _resolve_layout_device(device: str | None, torch_module) -> str:
     return requested
 
 
+def _load_layout_detector_model(model_loader, model_name: str):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*copying from a non-meta parameter in the checkpoint to a meta parameter in the current model.*",
+            category=UserWarning,
+            module=r"torch\.nn\.modules\.module",
+        )
+        return model_loader.from_pretrained(model_name)
+
+
 class FigureLayoutDetector:
     FIGURE_LABEL_TOKENS = ("picture", "figure", "chart", "diagram", "graphic", "image")
 
@@ -697,7 +709,7 @@ class FigureLayoutDetector:
         self.score_threshold = score_threshold
         self.torch = torch
         self.processor = AutoImageProcessor.from_pretrained(model_name)
-        self.model = AutoModelForObjectDetection.from_pretrained(model_name)
+        self.model = _load_layout_detector_model(AutoModelForObjectDetection, model_name)
         self.model.to(self.device)
         self.model.eval()
 
