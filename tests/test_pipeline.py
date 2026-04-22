@@ -9,11 +9,14 @@ import pytest
 from PIL import Image
 
 from olmocr.pipeline import (
+    DetectedFigureRef,
     LayoutDetection,
     PageResult,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
+    _rewrite_markdown_with_detected_refs,
     build_page_query,
+    detect_page_figure_refs,
     detect_missing_figure_refs,
     extract_page_images,
     get_markdown_path,
@@ -724,6 +727,64 @@ class TestMarkdownImageExtraction:
         assert 1 in detected
         assert detected[1] == ["page_1_30_40_60_55.png"]
 
+    def test_detect_page_figure_refs_uses_detector_output_as_canonical_list(self):
+        img = Image.new("RGB", (120, 120), color="white")
+        for x in range(32, 88):
+            for y in range(42, 92):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 120, 120),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 120, 120))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.97, box=(32, 42, 88, 92))]
+
+        natural_text = "Body text ![Wrong Box](page_1_2_2_12_10.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    detected = detect_page_figure_refs(natural_text, "dummy.pdf", page_spans=[[0, len(natural_text), 1]], layout_model_name="mock-layout")
+
+        assert 1 in detected
+        assert [ref.filename for ref in detected[1]] == ["page_1_32_42_56_50.png"]
+        assert detected[1][0].discovery_source == "layout-detector-refined"
+
+    def test_detect_page_figure_refs_filters_text_line_fragments(self):
+        img = Image.new("RGB", (160, 160), color="white")
+        for x in range(18, 142):
+            for y in range(28, 36):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 160, 160),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 160, 160))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.9, box=(18, 28, 142, 36))]
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    detected = detect_page_figure_refs("plain page text", "dummy.pdf", page_spans=[[0, 15, 1]], layout_model_name="mock-layout")
+
+        assert detected == {}
+
     def test_extract_page_images_saves_auto_detected_figure_without_vlm_ref(self, tmp_path):
         img = Image.new("RGB", (120, 120), color="white")
         for x in range(30, 90):
@@ -759,6 +820,26 @@ class TestMarkdownImageExtraction:
 
         assert "![Figure](page_2_10_20_30_40.png)" in augmented
         assert augmented.endswith("![Figure](page_2_10_20_30_40.png)")
+
+    def test_rewrite_markdown_with_detected_refs_replaces_vlm_refs_with_canonical_refs(self):
+        text = "Page text ![Existing Caption](page_1_2_2_12_10.png)"
+        rewritten = _rewrite_markdown_with_detected_refs(
+            text,
+            [[0, len(text), 1]],
+            {
+                1: [
+                    DetectedFigureRef(
+                        page_num=1,
+                        box=(4, 4, 24, 20),
+                        filename="page_1_4_4_20_16.png",
+                        discovery_source="layout-detector",
+                    )
+                ]
+            },
+        )
+
+        assert "page_1_2_2_12_10.png" not in rewritten
+        assert "![Figure](page_1_4_4_20_16.png)" in rewritten
 
 
 class TestPromptContract:

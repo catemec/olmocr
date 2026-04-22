@@ -653,6 +653,7 @@ def build_dolma_document(pdf_orig_path, page_results):
 
 
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
+_MARKDOWN_IMAGE_TAG_RE = re.compile(r"!\[([^\]]*)\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
 
 
 @dataclass(frozen=True)
@@ -660,6 +661,14 @@ class LayoutDetection:
     label: str
     score: float
     box: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class DetectedFigureRef:
+    page_num: int
+    box: tuple[int, int, int, int]
+    filename: str
+    discovery_source: str
 
 
 class FigureLayoutDetector:
@@ -758,22 +767,90 @@ def _normalize_box(box: tuple[int, int, int, int], iw: int, ih: int) -> tuple[in
     return normalized
 
 
-def _append_deduped_box(existing_boxes: list[tuple[int, int, int, int]], candidate_box: tuple[int, int, int, int], iw: int, ih: int) -> None:
+def _append_deduped_box(existing_boxes: list[tuple[int, int, int, int]], candidate_box: tuple[int, int, int, int], iw: int, ih: int) -> bool:
     normalized = _normalize_box(candidate_box, iw, ih)
     if normalized is None:
-        return
+        return False
 
     candidate_area = _box_area(normalized)
     if candidate_area == 0:
-        return
+        return False
 
     for existing in existing_boxes:
         if _box_iou(existing, normalized) >= 0.5:
-            return
+            return False
         if _intersection_area(existing, normalized) / candidate_area >= 0.85:
-            return
+            return False
 
     existing_boxes.append(normalized)
+    return True
+
+
+def _count_true_runs(values: list[bool]) -> int:
+    runs = 0
+    in_run = False
+    for value in values:
+        if value and not in_run:
+            runs += 1
+            in_run = True
+        elif not value:
+            in_run = False
+    return runs
+
+
+def _is_probable_text_fragment(box: tuple[int, int, int, int], img: Image.Image) -> bool:
+    left, upper, right, lower = box
+    width = max(0, right - left)
+    height = max(0, lower - upper)
+    if width == 0 or height == 0:
+        return True
+
+    page_width, page_height = img.size
+    area_fraction = (width * height) / max(page_width * page_height, 1)
+    aspect_ratio = width / max(height, 1)
+    if area_fraction >= 0.004 or aspect_ratio < 6.0 or height > max(64, int(page_height * 0.12)):
+        return False
+
+    crop = img.crop((left, upper, right, lower)).convert("L")
+    threshold_table = [255 if pixel > 235 else 0 for pixel in range(256)]
+    mask = crop.point(threshold_table, mode="1")
+    pixels = mask.tobytes()
+    row_active: list[bool] = []
+    col_active: list[bool] = []
+
+    for row in range(height):
+        ink_pixels = 0
+        for col in range(width):
+            if pixels[row * width + col] == 0:
+                ink_pixels += 1
+        row_active.append(ink_pixels >= max(1, int(width * 0.02)))
+
+    for col in range(width):
+        ink_pixels = 0
+        for row in range(height):
+            if pixels[row * width + col] == 0:
+                ink_pixels += 1
+        col_active.append(ink_pixels >= max(1, int(height * 0.02)))
+
+    row_runs = _count_true_runs(row_active)
+    col_runs = _count_true_runs(col_active)
+    active_rows = sum(row_active)
+    return row_runs <= 3 and col_runs <= 2 and active_rows <= max(12, int(height * 0.45))
+
+
+def _accept_figure_candidate(box: tuple[int, int, int, int], img: Image.Image, source: str) -> bool:
+    page_width, page_height = img.size
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    if width <= 0 or height <= 0:
+        return False
+    if _is_page_sized_box(box, page_width, page_height):
+        return False
+    if source.startswith("pdf-anchor"):
+        return True
+    if width < max(20, int(page_width * 0.025)) or height < max(20, int(page_height * 0.025)):
+        return False
+    return not _is_probable_text_fragment(box, img)
 
 
 def _report_looks_scanned(report) -> bool:
@@ -910,7 +987,7 @@ def _pick_layout_detection(model_box: tuple[int, int, int, int], detections: lis
     return best_box
 
 
-def _enumerate_page_figure_boxes(
+def _enumerate_page_figure_refs(
     img: "Image.Image",
     pdf_path: str,
     page_num: int,
@@ -918,14 +995,23 @@ def _enumerate_page_figure_boxes(
     layout_model_name: str | None,
     layout_model_device: str,
     layout_model_score_threshold: float,
-) -> list[tuple[int, int, int, int]]:
+) -> list[DetectedFigureRef]:
     iw, ih = img.size
+    refs: list[DetectedFigureRef] = []
     candidate_boxes: list[tuple[int, int, int, int]] = []
 
     anchor_boxes, report = _get_anchor_candidate_boxes(iw, ih, pdf_path, page_num, report_cache)
     if report is not None and not _report_looks_scanned(report):
         for anchor_box in anchor_boxes:
-            _append_deduped_box(candidate_boxes, anchor_box, iw, ih)
+            if _accept_figure_candidate(anchor_box, img, "pdf-anchor-enum") and _append_deduped_box(candidate_boxes, anchor_box, iw, ih):
+                refs.append(
+                    DetectedFigureRef(
+                        page_num=page_num,
+                        box=candidate_boxes[-1],
+                        filename=_box_to_ref_filename(page_num, candidate_boxes[-1]),
+                        discovery_source="pdf-anchor-enum",
+                    )
+                )
 
     detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold)
     if detector is not None:
@@ -933,13 +1019,103 @@ def _enumerate_page_figure_boxes(
             for detection in detector.detect(img):
                 refined = _local_component_crop(detection.box, img, window_box=_expand_box(detection.box, 24, 24, iw, ih))
                 candidate = refined if refined is not None else detection.box
-                _append_deduped_box(candidate_boxes, candidate, iw, ih)
+                normalized = _normalize_box(candidate, iw, ih)
+                if normalized is None:
+                    continue
+                source = "layout-detector-refined" if refined is not None else "layout-detector"
+                if not _accept_figure_candidate(normalized, img, source):
+                    continue
+                if _append_deduped_box(candidate_boxes, normalized, iw, ih):
+                    refs.append(
+                        DetectedFigureRef(
+                            page_num=page_num,
+                            box=candidate_boxes[-1],
+                            filename=_box_to_ref_filename(page_num, candidate_boxes[-1]),
+                            discovery_source=source,
+                        )
+                    )
         except Exception as exc:
             logger.warning(
                 f"Figure layout detection failed for {pdf_path} page {page_num} during page enumeration, falling back to structural extraction only: {exc}"
             )
 
-    return candidate_boxes
+    return refs
+
+
+def detect_page_figure_refs(
+    natural_text: str,
+    pdf_path: str,
+    page_spans: list | None = None,
+    dim: int = 2048,
+    layout_model_name: str | None = None,
+    layout_model_device: str = "cpu",
+    layout_model_score_threshold: float = 0.35,
+) -> dict[int, list[DetectedFigureRef]]:
+    ref_boxes_by_page = _extract_ref_boxes_by_page(natural_text, page_spans)
+    report_cache: dict[int, PageReport | None] = {}
+    page_cache: dict[int, Image.Image] = {}
+
+    if page_spans:
+        page_numbers = [page_num for _, _, page_num in page_spans]
+    else:
+        page_numbers = sorted(ref_boxes_by_page) or [1]
+
+    detected_refs_by_page: dict[int, list[DetectedFigureRef]] = {}
+    for page_num in page_numbers:
+        if page_num not in page_cache:
+            b64 = render_pdf_to_base64png(pdf_path, page_num, target_longest_image_dim=dim)
+            page_cache[page_num] = Image.open(BytesIO(base64.b64decode(b64)))
+
+        img = page_cache[page_num]
+        page_refs = _enumerate_page_figure_refs(
+            img,
+            pdf_path,
+            page_num,
+            report_cache,
+            layout_model_name,
+            layout_model_device,
+            layout_model_score_threshold,
+        )
+
+        if not page_refs:
+            fallback_boxes: list[tuple[int, int, int, int]] = []
+            for box in ref_boxes_by_page.get(page_num, []):
+                normalized = _normalize_box(box, img.width, img.height)
+                if normalized is None:
+                    continue
+                refined_box, crop_source = _refine_figure_crop(
+                    normalized[0],
+                    normalized[1],
+                    normalized[2] - normalized[0],
+                    normalized[3] - normalized[1],
+                    img,
+                    pdf_path,
+                    page_num,
+                    report_cache,
+                    layout_model_name=layout_model_name,
+                    layout_model_device=layout_model_device,
+                    layout_model_score_threshold=layout_model_score_threshold,
+                )
+                normalized_refined = _normalize_box(refined_box, img.width, img.height)
+                if normalized_refined is None or not _accept_figure_candidate(normalized_refined, img, crop_source):
+                    continue
+                if _append_deduped_box(fallback_boxes, normalized_refined, img.width, img.height):
+                    page_refs.append(
+                        DetectedFigureRef(
+                            page_num=page_num,
+                            box=normalized_refined,
+                            filename=_box_to_ref_filename(page_num, normalized_refined),
+                            discovery_source=f"vlm-ref-fallback:{crop_source}",
+                        )
+                    )
+
+        if page_refs:
+            detected_refs_by_page[page_num] = page_refs
+            logger.info(
+                f"Detected {len(page_refs)} canonical figure refs on page {page_num} of {pdf_path}: " + ", ".join(ref.discovery_source for ref in page_refs)
+            )
+
+    return detected_refs_by_page
 
 
 def _local_component_crop(
@@ -1215,6 +1391,57 @@ def _extract_ref_boxes_by_page(natural_text: str, page_spans: list | None = None
     return page_boxes
 
 
+def _rewrite_markdown_with_detected_refs(
+    natural_text: str,
+    page_spans: list | None,
+    detected_refs_by_page: dict[int, list[DetectedFigureRef]],
+) -> str:
+    if not detected_refs_by_page:
+        return natural_text
+
+    existing_refs_by_page: dict[int, list[tuple[str, tuple[int, int, int, int]]]] = {}
+    for match in _MARKDOWN_IMAGE_TAG_RE.finditer(natural_text):
+        filename = match.group(2)
+        page_num, x, y, w, h = _parse_image_ref_filename(filename)
+        if page_num is None:
+            page_num = _resolve_image_ref_page(match.start(), page_spans)
+        existing_refs_by_page.setdefault(page_num, []).append((match.group(1).strip(), (x, y, x + w, y + h)))
+
+    def _page_text_with_refs(page_text: str, page_num: int) -> str:
+        cleaned = _MARKDOWN_IMAGE_TAG_RE.sub("", page_text).rstrip("\n")
+        page_refs = detected_refs_by_page.get(page_num, [])
+        if not page_refs:
+            return cleaned
+
+        unmatched_existing = list(existing_refs_by_page.get(page_num, []))
+        rendered_refs: list[str] = []
+        for detected_ref in page_refs:
+            alt_text = "Figure"
+            best_index = None
+            best_score = 0.0
+            for idx, (existing_alt, existing_box) in enumerate(unmatched_existing):
+                score = _box_iou(detected_ref.box, existing_box)
+                if score > best_score:
+                    best_score = score
+                    best_index = idx
+            if best_index is not None and best_score >= 0.35:
+                matched_alt, _ = unmatched_existing.pop(best_index)
+                alt_text = matched_alt or "Figure"
+            rendered_refs.append(f"![{alt_text}]({detected_ref.filename})")
+
+        addition_text = "\n\n".join(rendered_refs)
+        return cleaned + ("\n\n" if cleaned else "") + addition_text
+
+    if not page_spans:
+        return _page_text_with_refs(natural_text, 1)
+
+    parts = []
+    for span_start, span_end, page_num in page_spans:
+        parts.append(_page_text_with_refs(natural_text[span_start:span_end], page_num))
+
+    return "\n\n".join(parts)
+
+
 def _augment_markdown_with_detected_refs(
     natural_text: str,
     page_spans: list | None,
@@ -1222,32 +1449,20 @@ def _augment_markdown_with_detected_refs(
 ) -> str:
     if not detected_refs_by_page:
         return natural_text
-
-    existing_refs = {match.group(1) for match in _IMAGE_REF_RE.finditer(natural_text)}
-    filtered_by_page = {
-        page_num: [ref for ref in refs if ref not in existing_refs]
+    canonical_refs_by_page = {
+        page_num: [
+            DetectedFigureRef(
+                page_num=page_num,
+                box=(x, y, x + w, y + h),
+                filename=filename,
+                discovery_source="compat",
+            )
+            for filename in refs
+            for _, x, y, w, h in [_parse_image_ref_filename(filename)]
+        ]
         for page_num, refs in detected_refs_by_page.items()
-        if any(ref not in existing_refs for ref in refs)
     }
-    if not filtered_by_page:
-        return natural_text
-
-    if not page_spans:
-        additions = []
-        for page_num in sorted(filtered_by_page):
-            additions.extend(f"![Figure]({ref})" for ref in filtered_by_page[page_num])
-        return natural_text + ("\n\n" if natural_text else "") + "\n\n".join(additions)
-
-    parts = []
-    for idx, (span_start, span_end, page_num) in enumerate(page_spans):
-        page_text = natural_text[span_start:span_end].rstrip("\n")
-        additions = filtered_by_page.get(page_num, [])
-        if additions:
-            addition_text = "\n\n".join(f"![Figure]({ref})" for ref in additions)
-            page_text = page_text + ("\n\n" if page_text else "") + addition_text
-        parts.append(page_text)
-
-    return "\n\n".join(parts)
+    return _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
 
 
 def detect_missing_figure_refs(
@@ -1259,46 +1474,16 @@ def detect_missing_figure_refs(
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
 ) -> dict[int, list[str]]:
-    ref_boxes_by_page = _extract_ref_boxes_by_page(natural_text, page_spans)
-    report_cache: dict[int, PageReport | None] = {}
-    page_cache: dict[int, Image.Image] = {}
-
-    if page_spans:
-        page_numbers = [page_num for _, _, page_num in page_spans]
-    else:
-        page_numbers = sorted(ref_boxes_by_page) or [1]
-
-    detected_refs_by_page: dict[int, list[str]] = {}
-    for page_num in page_numbers:
-        if page_num not in page_cache:
-            b64 = render_pdf_to_base64png(pdf_path, page_num, target_longest_image_dim=dim)
-            page_cache[page_num] = Image.open(BytesIO(base64.b64decode(b64)))
-
-        img = page_cache[page_num]
-        iw, ih = img.size
-        existing_boxes = [box for box in ref_boxes_by_page.get(page_num, []) if _normalize_box(box, iw, ih) is not None]
-        page_refs: list[str] = []
-        for box in _enumerate_page_figure_boxes(
-            img,
-            pdf_path,
-            page_num,
-            report_cache,
-            layout_model_name,
-            layout_model_device,
-            layout_model_score_threshold,
-        ):
-            if any(
-                _box_iou(box, existing_box) >= 0.35 or _intersection_area(box, existing_box) / max(_box_area(box), 1) >= 0.75 for existing_box in existing_boxes
-            ):
-                continue
-            existing_boxes.append(box)
-            page_refs.append(_box_to_ref_filename(page_num, box))
-
-        if page_refs:
-            detected_refs_by_page[page_num] = page_refs
-            logger.info(f"Detected {len(page_refs)} additional figure refs on page {page_num} of {pdf_path}")
-
-    return detected_refs_by_page
+    canonical_refs_by_page = detect_page_figure_refs(
+        natural_text,
+        pdf_path,
+        page_spans=page_spans,
+        dim=dim,
+        layout_model_name=layout_model_name,
+        layout_model_device=layout_model_device,
+        layout_model_score_threshold=layout_model_score_threshold,
+    )
+    return {page_num: [ref.filename for ref in refs] for page_num, refs in canonical_refs_by_page.items()}
 
 
 def extract_page_images(
@@ -1332,15 +1517,18 @@ def extract_page_images(
             filenames.append(filename)
 
     if detected_refs_by_page is None:
-        detected_refs_by_page = detect_missing_figure_refs(
-            natural_text,
-            pdf_path,
-            page_spans=page_spans,
-            dim=dim,
-            layout_model_name=layout_model_name,
-            layout_model_device=layout_model_device,
-            layout_model_score_threshold=layout_model_score_threshold,
-        )
+        detected_refs_by_page = {
+            page_num: [ref.filename for ref in refs]
+            for page_num, refs in detect_page_figure_refs(
+                natural_text,
+                pdf_path,
+                page_spans=page_spans,
+                dim=dim,
+                layout_model_name=layout_model_name,
+                layout_model_device=layout_model_device,
+                layout_model_score_threshold=layout_model_score_threshold,
+            ).items()
+        }
 
     for refs in detected_refs_by_page.values():
         for filename in refs:
@@ -1532,7 +1720,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                             and not source_file.startswith("weka://")
                             and "::" not in source_file
                         ):
-                            detected_refs_by_page = detect_missing_figure_refs(
+                            canonical_refs_by_page = detect_page_figure_refs(
                                 natural_text,
                                 source_file,
                                 page_spans=page_spans,
@@ -1540,7 +1728,8 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                                 layout_model_device=args.figure_layout_device,
                                 layout_model_score_threshold=args.figure_layout_score_threshold,
                             )
-                            natural_text = _augment_markdown_with_detected_refs(natural_text, page_spans, detected_refs_by_page)
+                            natural_text = _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
+                            detected_refs_by_page = {page_num: [ref.filename for ref in refs] for page_num, refs in canonical_refs_by_page.items()}
 
                         # For local paths, create the directory structure and write the file
                         os.makedirs(markdown_dir, exist_ok=True)
