@@ -17,6 +17,7 @@ from olmocr.pipeline import (
     get_markdown_path,
     process_page,
 )
+from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
 from olmocr.prompts.anchor import BoundingBox, ImageElement, PageReport
 
 
@@ -645,6 +646,63 @@ class TestMarkdownImageExtraction:
 
         cropped = Image.open(output_path)
         assert cropped.size == (30, 30)
+
+    def test_extract_page_images_refines_coarse_layout_detector_box(self, tmp_path):
+        img = Image.new("RGB", (160, 140), color="white")
+
+        # Caption/text line above the diagram.
+        for x in range(10, 150):
+            for y in range(18, 24):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # A disconnected diagram cluster lower on the page.
+        for x in range(38, 72):
+            for y in range(62, 90):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(94, 126):
+            for y in range(62, 90):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(70, 96):
+            for y in range(74, 78):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 160, 140),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 160, 140))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.9, box=(10, 10, 150, 96))]
+
+        natural_text = "![Figure](page_1_46_60_76_34.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_46_60_76_34.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[1] < 60
+        assert cropped.size[1] > 20
+
+
+class TestPromptContract:
+    def test_build_no_anchoring_v4_yaml_prompt_requests_approximate_figure_seed_box(self):
+        prompt = build_no_anchoring_v4_yaml_prompt(1000, 1200)
+
+        assert "approximate bounding box for the main visual figure region" in prompt
+        assert "does not need to be pixel-perfect" in prompt
+        assert "avoid surrounding paragraph text" in prompt
+        assert "prefer the main non-text visual region rather than the entire scanned page image" in prompt
 
     def test_extract_page_images_falls_back_locally_when_scanned_detector_unavailable(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")

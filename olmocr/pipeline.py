@@ -26,7 +26,7 @@ import boto3
 import httpx
 from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
-from PIL import Image
+from PIL import Image, ImageFilter
 from pypdf import PdfReader
 from tqdm import tqdm
 
@@ -836,15 +836,36 @@ def _pick_layout_detection(model_box: tuple[int, int, int, int], detections: lis
     return best_box
 
 
-def _local_component_crop(model_box: tuple[int, int, int, int], img: "Image.Image") -> tuple[int, int, int, int] | None:
+def _local_component_crop(
+    model_box: tuple[int, int, int, int],
+    img: "Image.Image",
+    window_box: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int] | None:
     iw, ih = img.size
-    margin_x = max(32, int((model_box[2] - model_box[0]) * 0.75))
-    margin_y = max(32, int((model_box[3] - model_box[1]) * 0.75))
-    window = _expand_box(model_box, margin_x, margin_y, iw, ih)
+    if window_box is None:
+        margin_x = max(32, int((model_box[2] - model_box[0]) * 0.75))
+        margin_y = max(32, int((model_box[3] - model_box[1]) * 0.75))
+        window = _expand_box(model_box, margin_x, margin_y, iw, ih)
+    else:
+        window = _clamp_box(window_box, iw, ih)
+
     gray = img.convert("L").crop(window)
     window_w, window_h = gray.size
-    pixels = gray.tobytes()
-    foreground = [value < 235 for value in pixels]
+    if window_w == 0 or window_h == 0:
+        return None
+
+    # A small dilation helps merge nearby diagram fragments without expanding across
+    # the larger whitespace gaps that typically separate surrounding text.
+    original_foreground = [value < 235 for value in gray.tobytes()]
+    mask = Image.frombytes(
+        "L",
+        (window_w, window_h),
+        bytes(255 if value else 0 for value in original_foreground),
+    )
+    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MaxFilter(5))
+
+    pixels = mask.tobytes()
+    foreground = [value > 0 for value in pixels]
     visited = bytearray(window_w * window_h)
 
     seed_local = (
@@ -854,12 +875,15 @@ def _local_component_crop(model_box: tuple[int, int, int, int], img: "Image.Imag
         model_box[3] - window[1],
     )
     seed_expanded = _expand_box(seed_local, 12, 12, window_w, window_h)
+    seed_area = max(_box_area(seed_local), 1)
     seed_cx = (seed_local[0] + seed_local[2]) // 2
     seed_cy = (seed_local[1] + seed_local[3]) // 2
+    window_area = max(window_w * window_h, 1)
 
-    candidate_boxes: list[tuple[int, int, int, int]] = []
     nearest_box: tuple[int, int, int, int] | None = None
     nearest_distance: float | None = None
+    best_box: tuple[int, int, int, int] | None = None
+    best_score: float | None = None
 
     for start_idx, is_foreground in enumerate(foreground):
         if not is_foreground or visited[start_idx]:
@@ -888,10 +912,23 @@ def _local_component_crop(model_box: tuple[int, int, int, int], img: "Image.Imag
                         queue.append(n_idx)
 
         component_box = (min_x, min_y, max_x + 1, max_y + 1)
-        if _intersection_area(component_box, seed_expanded) > 0 or (
-            component_box[0] <= seed_cx <= component_box[2] and component_box[1] <= seed_cy <= component_box[3]
-        ):
-            candidate_boxes.append(component_box)
+        overlap = _intersection_area(component_box, seed_expanded)
+        contains_center = component_box[0] <= seed_cx <= component_box[2] and component_box[1] <= seed_cy <= component_box[3]
+
+        comp_w = max(component_box[2] - component_box[0], 1)
+        comp_h = max(component_box[3] - component_box[1], 1)
+        aspect_ratio = max(comp_w / comp_h, comp_h / comp_w)
+        area_fraction = _box_area(component_box) / window_area
+        distance_norm = abs(((component_box[0] + component_box[2]) / 2) - seed_cx) / max(seed_local[2] - seed_local[0], 1) + abs(
+            ((component_box[1] + component_box[3]) / 2) - seed_cy
+        ) / max(seed_local[3] - seed_local[1], 1)
+        text_like_penalty = 0.35 if aspect_ratio > 9 and min(comp_w, comp_h) < max(seed_local[2] - seed_local[0], seed_local[3] - seed_local[1]) * 0.2 else 0.0
+
+        if overlap > 0 or contains_center:
+            component_score = (overlap / seed_area) * 4.0 + area_fraction * 1.5 - distance_norm - text_like_penalty
+            if best_score is None or component_score > best_score:
+                best_score = component_score
+                best_box = component_box
             continue
 
         comp_cx = (component_box[0] + component_box[2]) / 2
@@ -901,19 +938,27 @@ def _local_component_crop(model_box: tuple[int, int, int, int], img: "Image.Imag
             nearest_distance = distance
             nearest_box = component_box
 
-    if not candidate_boxes and nearest_box is not None:
-        candidate_boxes = [nearest_box]
+    if best_box is None and nearest_box is not None:
+        best_box = nearest_box
 
-    if not candidate_boxes:
+    if best_box is None:
         return None
 
-    local_box = (
-        min(box[0] for box in candidate_boxes),
-        min(box[1] for box in candidate_boxes),
-        max(box[2] for box in candidate_boxes),
-        max(box[3] for box in candidate_boxes),
-    )
-    return _clamp_box((window[0] + local_box[0], window[1] + local_box[1], window[0] + local_box[2], window[1] + local_box[3]), iw, ih)
+    refined_min_x, refined_min_y = window_w, window_h
+    refined_max_x, refined_max_y = -1, -1
+    for y in range(best_box[1], best_box[3]):
+        row_offset = y * window_w
+        for x in range(best_box[0], best_box[2]):
+            if original_foreground[row_offset + x]:
+                refined_min_x = min(refined_min_x, x)
+                refined_min_y = min(refined_min_y, y)
+                refined_max_x = max(refined_max_x, x)
+                refined_max_y = max(refined_max_y, y)
+
+    if refined_max_x >= refined_min_x and refined_max_y >= refined_min_y:
+        best_box = (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
+
+    return _clamp_box((window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3]), iw, ih)
 
 
 def _refine_figure_crop(
@@ -941,6 +986,9 @@ def _refine_figure_crop(
         try:
             layout_box = _pick_layout_detection(model_box, detector.detect(img))
             if layout_box is not None:
+                refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, 24, 24, iw, ih))
+                if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
+                    return refined_layout_box
                 return _clamp_box(layout_box, iw, ih)
         except Exception as exc:
             logger.warning(f"Figure layout detection failed for {pdf_path} page {page_num}, falling back to heuristic crop refinement: {exc}")

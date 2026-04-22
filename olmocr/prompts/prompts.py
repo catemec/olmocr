@@ -168,9 +168,10 @@ def build_no_anchoring_v4_yaml_prompt(image_width: int = 0, image_height: int = 
         "Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to HTML.\n"
         f"If there are any figures or charts, label them with the following markdown syntax "
         f"![Alt text describing the contents of the figure](page_startx_starty_width_height.png) "
-        f"where startx and starty are the pixel coordinates of the top-left corner of the figure "
+        f"where startx and starty are the pixel coordinates of the top-left corner of an approximate bounding box for the main visual figure region "
         f"(origin at the top-left of the image, x increases rightward, y increases downward), "
-        f"and width and height are in pixels.{dim_hint}\n"
+        f"and width and height are in pixels. The box does not need to be pixel-perfect, but it should cover the figure itself and avoid surrounding paragraph text, page margins, and unrelated captions when possible. "
+        f"For scanned pages, prefer the main non-text visual region rather than the entire scanned page image.{dim_hint}\n"
         "Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
     )
 
