@@ -2579,7 +2579,7 @@ async def main():
     parser.add_argument(
         "--figure_layout_device",
         type=str,
-        default="cpu",
+        default="auto",
         help="Device for the figure layout detector during markdown image extraction. Use 'auto', 'cpu', or a torch device such as 'cuda' or 'cuda:0'.",
     )
     parser.add_argument(
