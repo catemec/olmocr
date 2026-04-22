@@ -607,7 +607,7 @@ def build_dolma_document(pdf_orig_path, page_results):
 
     for index, page_result in enumerate(page_results):
         if page_result.response.natural_text is not None:
-            content = page_result.response.natural_text + ("\n" if index < len(page_results) - 1 else "")
+            content = page_result.response.natural_text + ("\n\n" if index < len(page_results) - 1 else "")
         else:
             content = ""
 
