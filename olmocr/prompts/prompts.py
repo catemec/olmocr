@@ -170,9 +170,9 @@ def build_no_anchoring_v4_yaml_prompt(image_width: int = 0, image_height: int = 
         f"![Alt text describing the contents of the figure](page_startx_starty_width_height.png) "
         f"where startx and starty are the pixel coordinates of the top-left corner of an approximate bounding box for the figure or image itself "
         f"(origin at the top-left of the image, x increases rightward, y increases downward), "
-        f"and width and height are in pixels. The box does not need to be pixel-perfect, but it should cover the figure or image itself and avoid surrounding paragraph text, page margins, and unrelated captions when possible. "
-        f"Include text that is part of the figure or image itself, such as labels inside a diagram, screenshots, or text-only images. Exclude nearby body text and captions that are outside the figure or image. "
-        f"For scanned pages, prefer the figure or image itself rather than the entire scanned page image.{dim_hint}\n"
+        f"and width and height are in pixels. The box does not need to be pixel-perfect, but it should cover the figure or image itself and, when present, the figure caption immediately attached below it while avoiding surrounding paragraph text, page margins, and unrelated nearby content. "
+        f"Include text that is part of the figure or image itself, such as labels inside a diagram, screenshots, or text-only images. Also include the figure caption when it belongs to that figure, but exclude nearby body text that is outside the figure-caption block. "
+        f"For scanned pages, prefer the figure together with its caption rather than the entire scanned page image.{dim_hint}\n"
         "Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
     )
 

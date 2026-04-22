@@ -688,6 +688,42 @@ class TestMarkdownImageExtraction:
         cropped = Image.open(output_path)
         assert cropped.size == (80, 70)
 
+    def test_extract_page_images_anchor_bbox_expands_to_caption(self, tmp_path):
+        img = Image.new("RGB", (140, 140), color="white")
+        for x in range(18, 122):
+            for y in range(16, 82):
+                img.putpixel((x, y), (0, 0, 0))
+
+        for x in range(34, 108):
+            for y in range(94, 101):
+                img.putpixel((x, y), (0, 0, 0))
+
+        for x in range(12, 128):
+            for y in range(116, 122):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        report = PageReport(
+            mediabox=BoundingBox(0, 0, 140, 140),
+            text_elements=[],
+            image_elements=[ImageElement("Im0", BoundingBox(18, 58, 122, 124))],
+        )
+
+        natural_text = "![Figure](page_1_30_20_30_30.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=report):
+                extract_page_images(natural_text, str(tmp_path), "dummy.pdf")
+
+        output_path = tmp_path / "page_1_30_20_30_30.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size == (104, 85)
+
     def test_extract_page_images_prefers_layout_detector_on_scanned_pages(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")
         for x in range(20, 50):
@@ -768,7 +804,7 @@ class TestMarkdownImageExtraction:
         assert cropped.size[1] < 60
         assert cropped.size[1] > 20
 
-    def test_extract_page_images_refines_coarse_layout_detector_box_without_caption_or_body_text(self, tmp_path):
+    def test_extract_page_images_refines_coarse_layout_detector_box_with_caption_but_without_body_text(self, tmp_path):
         img = Image.new("RGB", (220, 220), color="white")
 
         # Small page header near the top-right.
@@ -830,8 +866,8 @@ class TestMarkdownImageExtraction:
 
         cropped = Image.open(output_path)
         assert cropped.size[0] < 170
-        assert cropped.size[1] < 90
-        assert cropped.size[1] > 40
+        assert cropped.size[1] < 100
+        assert cropped.size[1] > 80
 
     def test_detect_missing_figure_refs_finds_layout_figure_without_vlm_ref(self):
         img = Image.new("RGB", (120, 120), color="white")
@@ -1185,8 +1221,10 @@ class TestPromptContract:
         assert "approximate bounding box for the figure or image itself" in prompt
         assert "does not need to be pixel-perfect" in prompt
         assert "Include text that is part of the figure or image itself" in prompt
-        assert "Exclude nearby body text and captions that are outside the figure or image" in prompt
-        assert "prefer the figure or image itself rather than the entire scanned page image" in prompt
+        assert "figure caption immediately attached below it" in prompt
+        assert "include the figure caption when it belongs to that figure" in prompt
+        assert "exclude nearby body text that is outside the figure-caption block" in prompt
+        assert "prefer the figure together with its caption rather than the entire scanned page image" in prompt
 
     def test_extract_page_images_falls_back_locally_when_scanned_detector_unavailable(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")

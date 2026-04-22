@@ -1154,6 +1154,97 @@ def _pick_layout_detection(model_box: tuple[int, int, int, int], detections: lis
     return best_box
 
 
+def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -> tuple[int, int, int, int]:
+    iw, ih = img.size
+    clamped_box = _clamp_box(box, iw, ih)
+    left, upper, right, lower = clamped_box
+    figure_width = max(right - left, 1)
+    figure_height = max(lower - upper, 1)
+
+    search_left = max(0, left - max(12, int(figure_width * 0.12)))
+    search_right = min(iw, right + max(12, int(figure_width * 0.12)))
+    if search_right <= search_left or lower >= ih:
+        return clamped_box
+
+    gap_limit = max(18, int(figure_height * 0.18))
+    inter_line_gap = max(4, int(figure_height * 0.06))
+    max_caption_height = max(90, int(figure_height * 0.55))
+    search_bottom = min(ih, lower + gap_limit + max_caption_height)
+    if search_bottom <= lower:
+        return clamped_box
+
+    gray = img.convert("L")
+    foreground = [value < 235 for value in gray.crop((search_left, lower, search_right, search_bottom)).tobytes()]
+    region_width = search_right - search_left
+    region_height = search_bottom - lower
+    caption_lines: list[tuple[int, int, int, int]] = []
+
+    y = 0
+    blank_rows = 0
+    lines_started = False
+    while y < region_height:
+        row_offset = y * region_width
+        row_has_ink = any(foreground[row_offset + x] for x in range(region_width))
+        if not row_has_ink:
+            blank_rows += 1
+            if not lines_started and blank_rows > gap_limit:
+                break
+            if lines_started and blank_rows > inter_line_gap:
+                break
+            y += 1
+            continue
+
+        line_top = y
+        line_left = region_width
+        line_right = -1
+        while y < region_height:
+            row_offset = y * region_width
+            row_has_ink = False
+            for x in range(region_width):
+                if foreground[row_offset + x]:
+                    row_has_ink = True
+                    line_left = min(line_left, x)
+                    line_right = max(line_right, x)
+            if not row_has_ink:
+                break
+            y += 1
+
+        if line_right < line_left:
+            continue
+
+        line_bottom = y
+        line_width = line_right - line_left + 1
+        line_height = line_bottom - line_top
+        abs_left = search_left + line_left
+        abs_right = search_left + line_right + 1
+        overlap_width = max(0, min(right, abs_right) - max(left, abs_left))
+        overlap_fraction = overlap_width / max(line_width, 1)
+        center_x = (abs_left + abs_right) / 2
+        is_centered = left - max(24, int(figure_width * 0.2)) <= center_x <= right + max(24, int(figure_width * 0.2))
+        width_ok = line_width <= max(int(figure_width * 1.35), 120)
+        height_ok = line_height <= max(20, int(figure_height * 0.18))
+        touches_caption_band = overlap_fraction >= 0.55 or is_centered
+
+        if not (width_ok and height_ok and touches_caption_band):
+            if lines_started:
+                break
+            blank_rows = gap_limit + 1
+            y += 1
+            continue
+
+        caption_lines.append((abs_left, lower + line_top, abs_right, lower + line_bottom))
+        lines_started = True
+        blank_rows = 0
+        if len(caption_lines) >= 3:
+            break
+
+    if not caption_lines:
+        return clamped_box
+
+    caption_lower = max(line[3] for line in caption_lines)
+    return _clamp_box((left, upper, right, caption_lower), iw, ih)
+
+
 def _enumerate_page_figure_refs(
     img: "Image.Image",
     pdf_path: str,
@@ -1438,32 +1529,6 @@ def _local_component_crop(
     if refined_max_x >= refined_min_x and refined_max_y >= refined_min_y:
         best_box = (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
 
-    # Extend downward to include a caption (text lines just below the figure body).
-    # Captions are aggressively penalized by _component_text_penalty, so they never
-    # win the component-selection loop above; we tack them on here instead.
-    gap_limit = max(18, int(window_h * 0.04))   # max blank rows between figure and caption
-    inter_line_gap = 8                            # max blank rows between caption lines
-    height_limit = max(80, int(window_h * 0.18)) # max rows to absorb below figure
-    search_end = min(window_h, best_box[3] + gap_limit + height_limit)
-    blank_run = 0
-    in_caption = False
-    caption_end = None
-    for y in range(best_box[3], search_end):
-        row_offset = y * window_w
-        has_ink = any(original_foreground[row_offset + x] for x in range(window_w))
-        if has_ink:
-            if not in_caption and blank_run > gap_limit:
-                break  # too far below figure before finding any caption
-            in_caption = True
-            caption_end = y
-            blank_run = 0
-        else:
-            blank_run += 1
-            if in_caption and blank_run > inter_line_gap:
-                break  # trailing whitespace after caption text
-    if caption_end is not None:
-        best_box = (best_box[0], best_box[1], best_box[2], caption_end + 1)
-
     return _clamp_box((window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3]), iw, ih)
 
 
@@ -1483,9 +1548,12 @@ def _refine_figure_crop(
     iw, ih = img.size
     model_box = _clamp_box((model_x, model_y, model_x + model_w, model_y + model_h), iw, ih)
 
+    def _with_caption(candidate_box: tuple[int, int, int, int], source: str) -> tuple[tuple[int, int, int, int], str]:
+        return _extend_box_to_caption(candidate_box, img), source
+
     anchor_box, report = _find_best_anchor_box(model_box, iw, ih, pdf_path, page_num, report_cache)
     if anchor_box is not None and report is not None and not _report_looks_scanned(report) and not _is_page_sized_box(anchor_box, iw, ih):
-        return anchor_box, "pdf-anchor"
+        return _with_caption(anchor_box, "pdf-anchor")
 
     detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold)
     if detector is not None:
@@ -1494,19 +1562,19 @@ def _refine_figure_crop(
             if layout_box is not None:
                 refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, 24, 24, iw, ih))
                 if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
-                    return refined_layout_box, "layout-detector-refined"
-                return _clamp_box(layout_box, iw, ih), "layout-detector"
+                    return _with_caption(refined_layout_box, "layout-detector-refined")
+                return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
         except Exception as exc:
             logger.warning(f"Figure layout detection failed for {pdf_path} page {page_num}, falling back to heuristic crop refinement: {exc}")
 
     local_box = _local_component_crop(model_box, img)
     if local_box is not None:
-        return local_box, "local-components"
+        return _with_caption(local_box, "local-components")
 
     if anchor_box is not None and not _is_page_sized_box(anchor_box, iw, ih):
-        return anchor_box, "pdf-anchor-fallback"
+        return _with_caption(anchor_box, "pdf-anchor-fallback")
 
-    return model_box, "model-bbox"
+    return _with_caption(model_box, "model-bbox")
 
 
 def _anchor_crop(
