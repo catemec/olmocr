@@ -1071,7 +1071,7 @@ class TestMarkdownImageExtraction:
         assert augmented.endswith("![Figure](page_2_10_20_30_40.png)")
 
     def test_rewrite_markdown_with_detected_refs_replaces_vlm_refs_with_canonical_refs(self):
-        text = "Page text ![Existing Caption](page_1_2_2_12_10.png)"
+        text = "Page text ![An Instance of Works_In3](page_1_2_2_12_10.png)"
         rewritten = _rewrite_markdown_with_detected_refs(
             text,
             [[0, len(text), 1]],
@@ -1079,16 +1079,34 @@ class TestMarkdownImageExtraction:
                 1: [
                     DetectedFigureRef(
                         page_num=1,
-                        box=(4, 4, 24, 20),
-                        filename="page_1_4_4_20_16.png",
+                        box=(2, 2, 14, 12),
+                        filename="page_1_2_2_12_10.png",
                         discovery_source="layout-detector",
                     )
                 ]
             },
         )
 
-        assert "page_1_2_2_12_10.png" not in rewritten
-        assert "![Figure](page_1_4_4_20_16.png)" in rewritten
+        assert "![An Instance of Works\\_In3](page_1_2_2_12_10.png)" in rewritten
+
+    def test_rewrite_markdown_with_detected_refs_preserves_existing_alt_text_escapes(self):
+        text = "Page text ![An Instance of Works\\_In3](page_1_2_2_12_10.png)"
+        rewritten = _rewrite_markdown_with_detected_refs(
+            text,
+            [[0, len(text), 1]],
+            {
+                1: [
+                    DetectedFigureRef(
+                        page_num=1,
+                        box=(2, 2, 14, 12),
+                        filename="page_1_2_2_12_10.png",
+                        discovery_source="layout-detector",
+                    )
+                ]
+            },
+        )
+
+        assert "![An Instance of Works\\_In3](page_1_2_2_12_10.png)" in rewritten
 
 
 class TestPromptContract:

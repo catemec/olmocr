@@ -1583,6 +1583,23 @@ def _extract_page_texts(natural_text: str, page_spans: list | None) -> dict[int,
     return {page_num: natural_text[span_start:span_end] for span_start, span_end, page_num in page_spans}
 
 
+def _escape_markdown_image_alt_text(alt_text: str) -> str:
+    escaped: list[str] = []
+    idx = 0
+    while idx < len(alt_text):
+        char = alt_text[idx]
+        if char == "\\" and idx + 1 < len(alt_text):
+            escaped.append(char)
+            escaped.append(alt_text[idx + 1])
+            idx += 2
+            continue
+        if char in {"_", "*", "[", "]"}:
+            escaped.append("\\")
+        escaped.append(char)
+        idx += 1
+    return "".join(escaped)
+
+
 def _count_page_figure_mentions(page_text: str) -> int:
     return len({match.lower() for match in _FIGURE_CAPTION_RE.findall(page_text)})
 
@@ -1623,7 +1640,7 @@ def _rewrite_markdown_with_detected_refs(
             if best_index is not None and best_score >= 0.35:
                 matched_alt, _ = unmatched_existing.pop(best_index)
                 alt_text = matched_alt or "Figure"
-            rendered_refs.append(f"![{alt_text}]({detected_ref.filename})")
+            rendered_refs.append(f"![{_escape_markdown_image_alt_text(alt_text)}]({detected_ref.filename})")
 
         addition_text = "\n\n".join(rendered_refs)
         return cleaned + ("\n\n" if cleaned else "") + addition_text
