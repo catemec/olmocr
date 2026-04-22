@@ -9,11 +9,15 @@ import pytest
 from PIL import Image
 
 from olmocr.pipeline import (
+    LayoutDetection,
     PageResult,
+    _qualify_markdown_image_refs,
     build_page_query,
+    extract_page_images,
     get_markdown_path,
     process_page,
 )
+from olmocr.prompts.anchor import BoundingBox, ImageElement, PageReport
 
 
 def create_test_image(width=100, height=150):
@@ -568,3 +572,108 @@ class TestMarkdownPathHandling:
         assert resolved_path.startswith(resolved_workspace), (
             f"BUG: Path traversal attack! Markdown path '{resolved_path}' escapes " f"workspace '{resolved_workspace}'. Paths with ../ should be sanitized."
         )
+
+
+class TestMarkdownImageExtraction:
+    def test_qualify_markdown_image_refs_adds_page_numbers(self):
+        natural_text = "Page one ![Figure A](page_10_20_30_40.png)\n\nPage two ![Figure B](page_10_20_30_40.png)"
+        page_spans = [[0, 44, 1], [44, len(natural_text), 2]]
+
+        qualified = _qualify_markdown_image_refs(natural_text, page_spans)
+
+        assert "page_1_10_20_30_40.png" in qualified
+        assert "page_2_10_20_30_40.png" in qualified
+        assert qualified.count("page_10_20_30_40.png") == 0
+
+    def test_extract_page_images_uses_anchor_bbox(self, tmp_path):
+        img = Image.new("RGB", (100, 100), color="white")
+        for x in range(5, 85):
+            for y in range(5, 75):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        report = PageReport(
+            mediabox=BoundingBox(0, 0, 100, 100),
+            text_elements=[],
+            image_elements=[ImageElement("Im0", BoundingBox(5, 25, 85, 95))],
+        )
+
+        natural_text = "![Figure](page_1_10_10_10_10.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=report):
+                extract_page_images(natural_text, str(tmp_path), "dummy.pdf")
+
+        output_path = tmp_path / "page_1_10_10_10_10.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size == (80, 70)
+
+    def test_extract_page_images_prefers_layout_detector_on_scanned_pages(self, tmp_path):
+        img = Image.new("RGB", (100, 100), color="white")
+        for x in range(20, 50):
+            for y in range(30, 60):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 100, 100),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 100, 100))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.95, box=(20, 30, 50, 60))]
+
+        natural_text = "![Figure](page_1_20_30_30_30.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_20_30_30_30.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size == (30, 30)
+
+    def test_extract_page_images_falls_back_locally_when_scanned_detector_unavailable(self, tmp_path):
+        img = Image.new("RGB", (100, 100), color="white")
+        for x in range(18, 52):
+            for y in range(28, 62):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 100, 100),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 100, 100))],
+        )
+
+        natural_text = "![Figure](page_1_20_30_30_30.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="none")
+
+        output_path = tmp_path / "page_1_20_30_30_30.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[0] < 100
+        assert cropped.size[1] < 100
+        assert cropped.size[0] >= 30
+        assert cropped.size[1] >= 30

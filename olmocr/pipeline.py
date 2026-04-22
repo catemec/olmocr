@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import atexit
 import base64
+from collections import deque
 import datetime
 import hashlib
 import json
@@ -38,7 +39,7 @@ from olmocr.filter.filter import Language, PdfFilter
 from olmocr.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
 from olmocr.metrics import MetricsKeeper, WorkerTracker
 from olmocr.prompts import PageResponse, build_no_anchoring_v4_yaml_prompt
-from olmocr.prompts.anchor import _pdf_report, get_anchor_text
+from olmocr.prompts.anchor import PageReport, _merge_image_elements, _pdf_report, get_anchor_text
 from olmocr.s3_utils import (
     download_directory,
     download_zstd_csv,
@@ -651,17 +652,313 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
-_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_\d+_\d+_\d+_\d+\.png)\)")
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
 
 
-def _anchor_crop(model_x: int, model_y: int, model_w: int, model_h: int, iw: int, ih: int, pdf_path: str, page_num: int, report_cache: dict) -> tuple[int, int, int, int]:
-    """Try to refine the model's approximate pixel bbox using anchor-detected image elements.
+@dataclass(frozen=True)
+class LayoutDetection:
+    label: str
+    score: float
+    box: tuple[int, int, int, int]
 
-    For raster images embedded in the PDF the anchor system has exact positions;
-    we convert them from PDF coordinates (lower-left origin, points) to PIL pixel
-    space and return whichever anchor bbox overlaps most with the model's estimate.
-    Falls back to the model's coordinates when no good match exists.
-    """
+
+class FigureLayoutDetector:
+    FIGURE_LABEL_TOKENS = ("picture", "figure", "chart", "diagram", "graphic", "image")
+
+    def __init__(self, model_name: str, device: str, score_threshold: float):
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+
+        if device != "cpu" and not torch.cuda.is_available():
+            logger.warning(f"Figure layout detector requested device '{device}' but CUDA is unavailable, falling back to cpu")
+            device = "cpu"
+
+        self.device = torch.device(device)
+        self.score_threshold = score_threshold
+        self.torch = torch
+        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        self.model = AutoModelForObjectDetection.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def detect(self, image: "Image.Image") -> list[LayoutDetection]:
+        inputs = self.processor(images=image, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        with self.torch.no_grad():
+            outputs = self.model(**inputs)
+
+        target_sizes = self.torch.tensor([image.size[::-1]], device=self.device)
+        results = self.processor.post_process_object_detection(outputs, threshold=self.score_threshold, target_sizes=target_sizes)[0]
+
+        detections: list[LayoutDetection] = []
+        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+            label_name = str(self.model.config.id2label.get(int(label), int(label))).lower()
+            if not any(token in label_name for token in self.FIGURE_LABEL_TOKENS):
+                continue
+
+            x0, y0, x1, y1 = [int(round(v)) for v in box.tolist()]
+            detections.append(LayoutDetection(label=label_name, score=float(score), box=(x0, y0, x1, y1)))
+
+        return detections
+
+
+@cache
+def get_figure_layout_detector(model_name: str | None, device: str, score_threshold: float) -> FigureLayoutDetector | None:
+    if not model_name or model_name.lower() == "none":
+        return None
+
+    try:
+        return FigureLayoutDetector(model_name, device, score_threshold)
+    except Exception as exc:
+        logger.warning(f"Could not initialize figure layout detector '{model_name}', falling back to heuristic crop refinement: {exc}")
+        return None
+
+
+def _clamp_box(box: tuple[int, int, int, int], iw: int, ih: int) -> tuple[int, int, int, int]:
+    return (
+        max(0, min(box[0], iw)),
+        max(0, min(box[1], ih)),
+        max(0, min(box[2], iw)),
+        max(0, min(box[3], ih)),
+    )
+
+
+def _box_area(box: tuple[int, int, int, int]) -> int:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def _intersection_area(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> int:
+    return max(0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0])) * max(0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+
+
+def _expand_box(box: tuple[int, int, int, int], margin_x: int, margin_y: int, iw: int, ih: int) -> tuple[int, int, int, int]:
+    return _clamp_box((box[0] - margin_x, box[1] - margin_y, box[2] + margin_x, box[3] + margin_y), iw, ih)
+
+
+def _is_page_sized_box(box: tuple[int, int, int, int], iw: int, ih: int, min_fraction: float = 0.85) -> bool:
+    return _box_area(box) / max(iw * ih, 1) >= min_fraction
+
+
+def _report_looks_scanned(report) -> bool:
+    if report is None or not report.image_elements:
+        return False
+
+    merged_images = _merge_image_elements(report.image_elements)
+    if len(merged_images) != 1:
+        return False
+
+    page_area = max((report.mediabox.x1 - report.mediabox.x0) * (report.mediabox.y1 - report.mediabox.y0), 1.0)
+    image_bbox = merged_images[0].bbox
+    image_area = max((image_bbox.x1 - image_bbox.x0) * (image_bbox.y1 - image_bbox.y0), 0.0)
+    return image_area / page_area >= 0.85
+
+
+def _get_cached_page_report(pdf_path: str, page_num: int, report_cache: dict[int, PageReport | None]) -> PageReport | None:
+    if page_num not in report_cache:
+        try:
+            report_cache[page_num] = _pdf_report(pdf_path, page_num)
+        except Exception:
+            report_cache[page_num] = None
+    return report_cache[page_num]
+
+
+def _find_best_anchor_box(
+    model_box: tuple[int, int, int, int],
+    iw: int,
+    ih: int,
+    pdf_path: str,
+    page_num: int,
+    report_cache: dict[int, PageReport | None],
+) -> tuple[tuple[int, int, int, int] | None, PageReport | None]:
+    report = _get_cached_page_report(pdf_path, page_num, report_cache)
+    if report is None or not report.image_elements:
+        return None, report
+
+    pw = report.mediabox.x1 - report.mediabox.x0
+    ph = report.mediabox.y1 - report.mediabox.y0
+    if pw <= 0 or ph <= 0:
+        return None, report
+
+    sx = iw / pw
+    sy = ih / ph
+
+    best_overlap = 0
+    best_box: tuple[int, int, int, int] | None = None
+    for elem in _merge_image_elements(report.image_elements):
+        anchor_box = (
+            int((elem.bbox.x0 - report.mediabox.x0) * sx),
+            int((ph - (elem.bbox.y1 - report.mediabox.y0)) * sy),
+            int((elem.bbox.x1 - report.mediabox.x0) * sx),
+            int((ph - (elem.bbox.y0 - report.mediabox.y0)) * sy),
+        )
+        overlap = _intersection_area(model_box, anchor_box)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_box = _clamp_box(anchor_box, iw, ih)
+
+    if best_box is None:
+        return None, report
+
+    model_area = _box_area(model_box)
+    if model_area <= 0 or best_overlap / model_area <= 0.1:
+        return None, report
+
+    return best_box, report
+
+
+def _pick_layout_detection(model_box: tuple[int, int, int, int], detections: list[LayoutDetection]) -> tuple[int, int, int, int] | None:
+    if not detections:
+        return None
+
+    seed_cx = (model_box[0] + model_box[2]) / 2
+    seed_cy = (model_box[1] + model_box[3]) / 2
+    seed_w = max(model_box[2] - model_box[0], 1)
+    seed_h = max(model_box[3] - model_box[1], 1)
+
+    best_score = None
+    best_box = None
+    for detection in detections:
+        overlap = _intersection_area(model_box, detection.box)
+        contains_center = detection.box[0] <= seed_cx <= detection.box[2] and detection.box[1] <= seed_cy <= detection.box[3]
+        if overlap == 0 and not contains_center:
+            continue
+
+        det_cx = (detection.box[0] + detection.box[2]) / 2
+        det_cy = (detection.box[1] + detection.box[3]) / 2
+        center_distance = abs(det_cx - seed_cx) / seed_w + abs(det_cy - seed_cy) / seed_h
+        candidate_score = (overlap / max(_box_area(model_box), 1)) * 4.0 + detection.score - center_distance
+
+        if best_score is None or candidate_score > best_score:
+            best_score = candidate_score
+            best_box = detection.box
+
+    return best_box
+
+
+def _local_component_crop(model_box: tuple[int, int, int, int], img: "Image.Image") -> tuple[int, int, int, int] | None:
+    iw, ih = img.size
+    margin_x = max(32, int((model_box[2] - model_box[0]) * 0.75))
+    margin_y = max(32, int((model_box[3] - model_box[1]) * 0.75))
+    window = _expand_box(model_box, margin_x, margin_y, iw, ih)
+    gray = img.convert("L").crop(window)
+    window_w, window_h = gray.size
+    pixels = gray.tobytes()
+    foreground = [value < 235 for value in pixels]
+    visited = bytearray(window_w * window_h)
+
+    seed_local = (
+        model_box[0] - window[0],
+        model_box[1] - window[1],
+        model_box[2] - window[0],
+        model_box[3] - window[1],
+    )
+    seed_expanded = _expand_box(seed_local, 12, 12, window_w, window_h)
+    seed_cx = (seed_local[0] + seed_local[2]) // 2
+    seed_cy = (seed_local[1] + seed_local[3]) // 2
+
+    candidate_boxes: list[tuple[int, int, int, int]] = []
+    nearest_box: tuple[int, int, int, int] | None = None
+    nearest_distance: float | None = None
+
+    for start_idx, is_foreground in enumerate(foreground):
+        if not is_foreground or visited[start_idx]:
+            continue
+
+        queue = deque([start_idx])
+        visited[start_idx] = 1
+        min_x = max_x = start_idx % window_w
+        min_y = max_y = start_idx // window_w
+
+        while queue:
+            idx = queue.popleft()
+            x = idx % window_w
+            y = idx // window_w
+
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < window_w and 0 <= ny < window_h:
+                    n_idx = ny * window_w + nx
+                    if foreground[n_idx] and not visited[n_idx]:
+                        visited[n_idx] = 1
+                        queue.append(n_idx)
+
+        component_box = (min_x, min_y, max_x + 1, max_y + 1)
+        if _intersection_area(component_box, seed_expanded) > 0 or (
+            component_box[0] <= seed_cx <= component_box[2] and component_box[1] <= seed_cy <= component_box[3]
+        ):
+            candidate_boxes.append(component_box)
+            continue
+
+        comp_cx = (component_box[0] + component_box[2]) / 2
+        comp_cy = (component_box[1] + component_box[3]) / 2
+        distance = abs(comp_cx - seed_cx) + abs(comp_cy - seed_cy)
+        if nearest_distance is None or distance < nearest_distance:
+            nearest_distance = distance
+            nearest_box = component_box
+
+    if not candidate_boxes and nearest_box is not None:
+        candidate_boxes = [nearest_box]
+
+    if not candidate_boxes:
+        return None
+
+    local_box = (
+        min(box[0] for box in candidate_boxes),
+        min(box[1] for box in candidate_boxes),
+        max(box[2] for box in candidate_boxes),
+        max(box[3] for box in candidate_boxes),
+    )
+    return _clamp_box((window[0] + local_box[0], window[1] + local_box[1], window[0] + local_box[2], window[1] + local_box[3]), iw, ih)
+
+
+def _refine_figure_crop(
+    model_x: int,
+    model_y: int,
+    model_w: int,
+    model_h: int,
+    img: "Image.Image",
+    pdf_path: str,
+    page_num: int,
+    report_cache: dict[int, PageReport | None],
+    layout_model_name: str | None,
+    layout_model_device: str,
+    layout_model_score_threshold: float,
+) -> tuple[int, int, int, int]:
+    iw, ih = img.size
+    model_box = _clamp_box((model_x, model_y, model_x + model_w, model_y + model_h), iw, ih)
+
+    anchor_box, report = _find_best_anchor_box(model_box, iw, ih, pdf_path, page_num, report_cache)
+    if anchor_box is not None and report is not None and not _report_looks_scanned(report) and not _is_page_sized_box(anchor_box, iw, ih):
+        return anchor_box
+
+    detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold)
+    if detector is not None:
+        try:
+            layout_box = _pick_layout_detection(model_box, detector.detect(img))
+            if layout_box is not None:
+                return _clamp_box(layout_box, iw, ih)
+        except Exception as exc:
+            logger.warning(f"Figure layout detection failed for {pdf_path} page {page_num}, falling back to heuristic crop refinement: {exc}")
+
+    local_box = _local_component_crop(model_box, img)
+    if local_box is not None:
+        return local_box
+
+    if anchor_box is not None and not _is_page_sized_box(anchor_box, iw, ih):
+        return anchor_box
+
+    return model_box
+
+
+def _anchor_crop(
+    model_x: int, model_y: int, model_w: int, model_h: int, iw: int, ih: int, pdf_path: str, page_num: int, report_cache: dict
+) -> tuple[int, int, int, int]:
+    """Refine an approximate figure bbox using PDF image-element geometry when available."""
     if page_num not in report_cache:
         try:
             report_cache[page_num] = _pdf_report(pdf_path, page_num)
@@ -679,7 +976,6 @@ def _anchor_crop(model_x: int, model_y: int, model_w: int, model_h: int, iw: int
         best_box: tuple[int, int, int, int] | None = None
 
         for elem in report.image_elements:
-            # PDF coords: lower-left origin → PIL: top-left origin
             a_left = int((elem.bbox.x0 - report.mediabox.x0) * sx)
             a_right = int((elem.bbox.x1 - report.mediabox.x0) * sx)
             a_upper = int((ph - (elem.bbox.y1 - report.mediabox.y0)) * sy)
@@ -702,7 +998,6 @@ def _anchor_crop(model_x: int, model_y: int, model_w: int, model_h: int, iw: int
                 max(0, min(best_box[3], ih)),
             )
 
-    # Fallback: model's pixel coordinates (top-left origin)
     return (
         max(0, min(model_x, iw)),
         max(0, min(model_y, ih)),
@@ -711,20 +1006,75 @@ def _anchor_crop(model_x: int, model_y: int, model_w: int, model_h: int, iw: int
     )
 
 
-def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, page_spans: list | None = None, dim: int = 2048) -> None:
+def _parse_image_ref_filename(filename: str) -> tuple[int | None, int, int, int, int]:
+    stem = os.path.splitext(filename)[0]
+    parts = stem.split("_")
+    if parts[0] != "page":
+        raise ValueError(f"Unsupported image reference filename: {filename}")
+    if len(parts) == 5:
+        _, sx, sy, sw, sh = parts
+        return None, int(sx), int(sy), int(sw), int(sh)
+    if len(parts) == 6:
+        _, spage, sx, sy, sw, sh = parts
+        return int(spage), int(sx), int(sy), int(sw), int(sh)
+    raise ValueError(f"Unsupported image reference filename: {filename}")
+
+
+def _resolve_image_ref_page(ref_pos: int, page_spans: list | None) -> int:
+    if page_spans:
+        for span_start, span_end, page_num in page_spans:
+            if span_start <= ref_pos < span_end:
+                return page_num
+        return page_spans[-1][2]
+    return 1
+
+
+def _get_page_qualified_image_ref(filename: str, ref_pos: int, page_spans: list | None = None) -> str:
+    page_num, x, y, w, h = _parse_image_ref_filename(filename)
+    if page_num is None:
+        page_num = _resolve_image_ref_page(ref_pos, page_spans)
+    return f"page_{page_num}_{x}_{y}_{w}_{h}.png"
+
+
+def _qualify_markdown_image_refs(natural_text: str, page_spans: list | None = None) -> str:
+    matches = list(_IMAGE_REF_RE.finditer(natural_text))
+    if not matches:
+        return natural_text
+
+    output_parts = []
+    last_index = 0
+    for match in matches:
+        output_parts.append(natural_text[last_index : match.start(1)])
+        output_parts.append(_get_page_qualified_image_ref(match.group(1), match.start(), page_spans))
+        last_index = match.end(1)
+    output_parts.append(natural_text[last_index:])
+    return "".join(output_parts)
+
+
+def extract_page_images(
+    natural_text: str,
+    markdown_dir: str,
+    pdf_path: str,
+    page_spans: list | None = None,
+    dim: int = 2048,
+    layout_model_name: str | None = None,
+    layout_model_device: str = "cpu",
+    layout_model_score_threshold: float = 0.35,
+) -> None:
     """Crop and save figure images referenced in olmocr markdown output.
 
     The model emits references like ![caption](page_x_y_w_h.png) where
     startx/starty are pixel coordinates with top-left origin in the rendered
     image.  Page number is resolved from page_spans ([start, end, page_num]).
-    For embedded raster images the crop is refined using anchor-detected bboxes.
+    Crop boundaries are refined using PDF image-element geometry for digital PDFs
+    and layout/image analysis for scanned pages.
     """
     matches = list(_IMAGE_REF_RE.finditer(natural_text))
     if not matches:
         return
 
     page_cache: dict[int, Image.Image] = {}
-    report_cache: dict = {}
+    report_cache: dict[int, PageReport | None] = {}
 
     for m in matches:
         filename = m.group(1)
@@ -732,29 +1082,28 @@ def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, pag
         if os.path.exists(dest):
             continue
 
-        # filename format: page_x_y_w_h.png — "page" is a literal prefix
-        _, sx, sy, sw, sh = os.path.splitext(filename)[0].split("_")
-        x, y, w, h = int(sx), int(sy), int(sw), int(sh)
-
-        # Determine which PDF page this ref belongs to via character position
-        page_num = 1
-        if page_spans:
-            ref_pos = m.start()
-            for span_start, span_end, pnum in page_spans:
-                if span_start <= ref_pos < span_end:
-                    page_num = pnum
-                    break
-            else:
-                page_num = page_spans[-1][2]
+        page_num, x, y, w, h = _parse_image_ref_filename(filename)
+        if page_num is None:
+            page_num = _resolve_image_ref_page(m.start(), page_spans)
 
         if page_num not in page_cache:
             b64 = render_pdf_to_base64png(pdf_path, page_num, target_longest_image_dim=dim)
             page_cache[page_num] = Image.open(BytesIO(base64.b64decode(b64)))
 
         img = page_cache[page_num]
-        iw, ih = img.size
-
-        left, upper, right, lower = _anchor_crop(x, y, w, h, iw, ih, pdf_path, page_num, report_cache)
+        left, upper, right, lower = _refine_figure_crop(
+            x,
+            y,
+            w,
+            h,
+            img,
+            pdf_path,
+            page_num,
+            report_cache,
+            layout_model_name=layout_model_name,
+            layout_model_device=layout_model_device,
+            layout_model_score_threshold=layout_model_score_threshold,
+        )
 
         if right > left and lower > upper:
             img.crop((left, upper, right, lower)).save(dest, format="PNG")
@@ -876,7 +1225,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                 logger.info(f"Writing {len(dolma_docs)} markdown files for {work_item.hash}")
                 for doc in dolma_docs:
                     source_file = doc["metadata"]["Source-File"]
-                    natural_text = doc["text"]
+                    natural_text = _qualify_markdown_image_refs(doc["text"], doc.get("attributes", {}).get("pdf_page_numbers"))
 
                     markdown_path = get_markdown_path(args.workspace, source_file)
                     markdown_dir = os.path.dirname(markdown_path)
@@ -903,10 +1252,23 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                             md_f.write(natural_text)
 
                         # Extract figure images when the source PDF is also local
-                        if not source_file.startswith("s3://") and not source_file.startswith("gs://") and not source_file.startswith("weka://") and "::" not in source_file:
+                        if (
+                            not source_file.startswith("s3://")
+                            and not source_file.startswith("gs://")
+                            and not source_file.startswith("weka://")
+                            and "::" not in source_file
+                        ):
                             try:
                                 page_spans = doc.get("attributes", {}).get("pdf_page_numbers")
-                                extract_page_images(natural_text, markdown_dir, source_file, page_spans=page_spans)
+                                extract_page_images(
+                                    natural_text,
+                                    markdown_dir,
+                                    source_file,
+                                    page_spans=page_spans,
+                                    layout_model_name=args.figure_layout_model,
+                                    layout_model_device=args.figure_layout_device,
+                                    layout_model_score_threshold=args.figure_layout_score_threshold,
+                                )
                             except Exception as img_err:
                                 logger.warning(f"Image extraction failed for {source_file}: {img_err}")
 
@@ -1286,7 +1648,8 @@ def print_stats(args, root_work_queue):
             all_processed.update(paths)
 
     d, p, o, c = totals["docs"], totals["pages"], totals["output_tokens"], max(1, completed_items)
-    print(f"""
+    print(
+        f"""
 Work Items Status:
 Total work items: {total_items:,}
 Completed items: {completed_items:,}
@@ -1310,7 +1673,8 @@ Total tokens in long context documents: {totals['long_tokens']:,}
 
 English-only documents (>50% pages with 'en'): {totals['en_docs']:,}
 Total output tokens in English-only documents: {totals['en_tokens']:,}
-Projected English-only output tokens: {round(totals['en_tokens'] / c * total_items):,}""")
+Projected English-only output tokens: {round(totals['en_tokens'] / c * total_items):,}"""
+    )
 
 
 async def main():
@@ -1343,6 +1707,24 @@ async def main():
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
     parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
+    parser.add_argument(
+        "--figure_layout_model",
+        type=str,
+        default="Aryn/deformable-detr-DocLayNet",
+        help="Optional Hugging Face layout detection model used to localize figures on scanned markdown pages. Set to 'none' to disable.",
+    )
+    parser.add_argument(
+        "--figure_layout_device",
+        type=str,
+        default="gpu",
+        help="Device for the figure layout detector during markdown image extraction (default: gpu).",
+    )
+    parser.add_argument(
+        "--figure_layout_score_threshold",
+        type=float,
+        default=0.35,
+        help="Minimum detection score for scanned-page figure layout boxes.",
+    )
     parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1288)
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters), not used for new models", default=-1)
     parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding for model YAML type outputs")
