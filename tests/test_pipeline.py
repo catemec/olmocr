@@ -11,8 +11,10 @@ from PIL import Image
 from olmocr.pipeline import (
     LayoutDetection,
     PageResult,
+    _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
     build_page_query,
+    detect_missing_figure_refs,
     extract_page_images,
     get_markdown_path,
     process_page,
@@ -694,15 +696,80 @@ class TestMarkdownImageExtraction:
         assert cropped.size[1] < 60
         assert cropped.size[1] > 20
 
+    def test_detect_missing_figure_refs_finds_layout_figure_without_vlm_ref(self):
+        img = Image.new("RGB", (120, 120), color="white")
+        for x in range(30, 90):
+            for y in range(40, 95):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 120, 120),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 120, 120))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.96, box=(30, 40, 90, 95))]
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    detected = detect_missing_figure_refs("plain page text", "dummy.pdf", page_spans=[[0, 15, 1]], layout_model_name="mock-layout")
+
+        assert 1 in detected
+        assert detected[1] == ["page_1_30_40_60_55.png"]
+
+    def test_extract_page_images_saves_auto_detected_figure_without_vlm_ref(self, tmp_path):
+        img = Image.new("RGB", (120, 120), color="white")
+        for x in range(30, 90):
+            for y in range(40, 95):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 120, 120),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 120, 120))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.96, box=(30, 40, 90, 95))]
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images("plain page text", str(tmp_path), "dummy.pdf", page_spans=[[0, 15, 1]], layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_30_40_60_55.png"
+        assert output_path.exists()
+
+    def test_augment_markdown_with_detected_refs_appends_missing_refs_by_page(self):
+        text = "First page text\n\nSecond page text"
+        page_spans = [[0, 15, 1], [15, len(text), 2]]
+        augmented = _augment_markdown_with_detected_refs(text, page_spans, {2: ["page_2_10_20_30_40.png"]})
+
+        assert "![Figure](page_2_10_20_30_40.png)" in augmented
+        assert augmented.endswith("![Figure](page_2_10_20_30_40.png)")
+
 
 class TestPromptContract:
     def test_build_no_anchoring_v4_yaml_prompt_requests_approximate_figure_seed_box(self):
         prompt = build_no_anchoring_v4_yaml_prompt(1000, 1200)
 
-        assert "approximate bounding box for the main visual figure region" in prompt
+        assert "approximate bounding box for the figure or image itself" in prompt
         assert "does not need to be pixel-perfect" in prompt
-        assert "avoid surrounding paragraph text" in prompt
-        assert "prefer the main non-text visual region rather than the entire scanned page image" in prompt
+        assert "Include text that is part of the figure or image itself" in prompt
+        assert "Exclude nearby body text and captions that are outside the figure or image" in prompt
+        assert "prefer the figure or image itself rather than the entire scanned page image" in prompt
 
     def test_extract_page_images_falls_back_locally_when_scanned_detector_unavailable(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")
