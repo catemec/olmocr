@@ -671,6 +671,18 @@ class DetectedFigureRef:
     discovery_source: str
 
 
+def _resolve_layout_device(device: str | None, torch_module) -> str:
+    requested = (device or "auto").strip()
+    normalized = requested.lower()
+
+    if normalized in ("auto", "gpu"):
+        return "cuda" if torch_module.cuda.is_available() else "cpu"
+    if normalized.startswith("cuda") and not torch_module.cuda.is_available():
+        logger.warning(f"Figure layout detector requested device '{requested}' but CUDA is unavailable, falling back to cpu")
+        return "cpu"
+    return requested
+
+
 class FigureLayoutDetector:
     FIGURE_LABEL_TOKENS = ("picture", "figure", "chart", "diagram", "graphic", "image")
 
@@ -678,9 +690,7 @@ class FigureLayoutDetector:
         import torch
         from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
-        if device != "cpu" and not torch.cuda.is_available():
-            logger.warning(f"Figure layout detector requested device '{device}' but CUDA is unavailable, falling back to cpu")
-            device = "cpu"
+        device = _resolve_layout_device(device, torch)
 
         self.device = torch.device(device)
         self.score_threshold = score_threshold
@@ -718,7 +728,10 @@ def get_figure_layout_detector(model_name: str | None, device: str, score_thresh
         return None
 
     try:
-        return FigureLayoutDetector(model_name, device, score_threshold)
+        import torch
+
+        resolved_device = _resolve_layout_device(device, torch)
+        return FigureLayoutDetector(model_name, resolved_device, score_threshold)
     except Exception as exc:
         logger.warning(f"Could not initialize figure layout detector '{model_name}', falling back to heuristic crop refinement: {exc}")
         return None
@@ -851,6 +864,56 @@ def _accept_figure_candidate(box: tuple[int, int, int, int], img: Image.Image, s
     if width < max(20, int(page_width * 0.025)) or height < max(20, int(page_height * 0.025)):
         return False
     return not _is_probable_text_fragment(box, img)
+
+
+def _component_text_penalty(
+    component_box: tuple[int, int, int, int],
+    original_foreground: list[bool],
+    window_w: int,
+    window_h: int,
+) -> float:
+    comp_w = max(component_box[2] - component_box[0], 1)
+    comp_h = max(component_box[3] - component_box[1], 1)
+    aspect_ratio = comp_w / comp_h
+    ink_pixels = 0
+    dense_rows = 0
+    dense_cols = 0
+
+    for y in range(component_box[1], component_box[3]):
+        row_ink = 0
+        row_offset = y * window_w
+        for x in range(component_box[0], component_box[2]):
+            if original_foreground[row_offset + x]:
+                ink_pixels += 1
+                row_ink += 1
+        if row_ink >= max(1, int(comp_w * 0.18)):
+            dense_rows += 1
+
+    for x in range(component_box[0], component_box[2]):
+        col_ink = 0
+        for y in range(component_box[1], component_box[3]):
+            if original_foreground[y * window_w + x]:
+                col_ink += 1
+        if col_ink >= max(1, int(comp_h * 0.18)):
+            dense_cols += 1
+
+    dense_row_fraction = dense_rows / comp_h
+    dense_col_fraction = dense_cols / comp_w
+    fill_ratio = ink_pixels / max(comp_w * comp_h, 1)
+    touches_top_edge = component_box[1] <= max(2, int(window_h * 0.02))
+    touches_bottom_edge = component_box[3] >= window_h - max(2, int(window_h * 0.02))
+
+    penalty = 0.0
+    if aspect_ratio >= 2.5 and dense_row_fraction >= 0.18 and dense_col_fraction <= 0.35:
+        penalty += 1.5
+    if aspect_ratio >= 4.0 and dense_row_fraction >= 0.1:
+        penalty += 1.0
+    if fill_ratio <= 0.22 and dense_row_fraction >= 0.2 and dense_col_fraction <= 0.3:
+        penalty += 0.75
+    if (touches_top_edge or touches_bottom_edge) and aspect_ratio >= 2.0 and dense_row_fraction >= 0.12:
+        penalty += 0.75
+
+    return penalty
 
 
 def _report_looks_scanned(report) -> bool:
@@ -1136,15 +1199,15 @@ def _local_component_crop(
     if window_w == 0 or window_h == 0:
         return None
 
-    # A small dilation helps merge nearby diagram fragments without expanding across
-    # the larger whitespace gaps that typically separate surrounding text.
+    # A small dilation helps merge nearby diagram fragments without jumping across
+    # the larger whitespace gaps that typically separate captions and body text.
     original_foreground = [value < 235 for value in gray.tobytes()]
     mask = Image.frombytes(
         "L",
         (window_w, window_h),
         bytes(255 if value else 0 for value in original_foreground),
     )
-    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MaxFilter(5))
+    mask = mask.filter(ImageFilter.MaxFilter(5))
 
     pixels = mask.tobytes()
     foreground = [value > 0 for value in pixels]
@@ -1204,7 +1267,9 @@ def _local_component_crop(
         distance_norm = abs(((component_box[0] + component_box[2]) / 2) - seed_cx) / max(seed_local[2] - seed_local[0], 1) + abs(
             ((component_box[1] + component_box[3]) / 2) - seed_cy
         ) / max(seed_local[3] - seed_local[1], 1)
-        text_like_penalty = 0.35 if aspect_ratio > 9 and min(comp_w, comp_h) < max(seed_local[2] - seed_local[0], seed_local[3] - seed_local[1]) * 0.2 else 0.0
+        text_like_penalty = _component_text_penalty(component_box, original_foreground, window_w, window_h)
+        if aspect_ratio > 9 and min(comp_w, comp_h) < max(seed_local[2] - seed_local[0], seed_local[3] - seed_local[1]) * 0.2:
+            text_like_penalty += 0.35
 
         if overlap > 0 or contains_center:
             component_score = (overlap / seed_area) * 4.0 + area_fraction * 1.5 - distance_norm - text_like_penalty
@@ -2201,8 +2266,8 @@ async def main():
     parser.add_argument(
         "--figure_layout_device",
         type=str,
-        default="gpu",
-        help="Device for the figure layout detector during markdown image extraction (default: gpu).",
+        default="auto",
+        help="Device for the figure layout detector during markdown image extraction. Use 'auto', 'cpu', or a torch device such as 'cuda' or 'cuda:0'.",
     )
     parser.add_argument(
         "--figure_layout_score_threshold",

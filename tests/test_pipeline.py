@@ -699,6 +699,71 @@ class TestMarkdownImageExtraction:
         assert cropped.size[1] < 60
         assert cropped.size[1] > 20
 
+    def test_extract_page_images_refines_coarse_layout_detector_box_without_caption_or_body_text(self, tmp_path):
+        img = Image.new("RGB", (220, 220), color="white")
+
+        # Small page header near the top-right.
+        for x in range(150, 205):
+            for y in range(8, 18):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Main diagram content.
+        for x in range(40, 180):
+            for y in range(48, 54):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(55, 65):
+            for y in range(55, 120):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(150, 160):
+            for y in range(55, 120):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(75, 145):
+            for y in range(78, 88):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(82, 138):
+            for y in range(98, 108):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Caption line below the figure.
+        for x in range(62, 160):
+            for y in range(132, 139):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Body text block lower on the page.
+        for line_y in (156, 168, 180, 192):
+            for x in range(18, 205):
+                for y in range(line_y, line_y + 5):
+                    img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 220, 220),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 220, 220))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.93, box=(10, 0, 210, 210))]
+
+        natural_text = "![Figure](page_1_10_0_200_210.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_10_0_200_210.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[0] < 170
+        assert cropped.size[1] < 90
+        assert cropped.size[1] > 40
+
     def test_detect_missing_figure_refs_finds_layout_figure_without_vlm_ref(self):
         img = Image.new("RGB", (120, 120), color="white")
         for x in range(30, 90):
