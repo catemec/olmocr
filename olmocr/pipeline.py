@@ -1242,7 +1242,9 @@ def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -
         return clamped_box
 
     caption_lower = max(line[3] for line in caption_lines)
-    return _clamp_box((left, upper, right, caption_lower), iw, ih)
+    caption_left = min(line[0] for line in caption_lines)
+    caption_right = max(line[2] for line in caption_lines)
+    return _clamp_box((min(left, caption_left), upper, max(right, caption_right), caption_lower), iw, ih)
 
 
 def _enumerate_page_figure_refs(
@@ -1496,7 +1498,9 @@ def _local_component_crop(
             text_like_penalty += 0.35
 
         if overlap > 0 or contains_center:
-            component_score = (overlap / seed_area) * 4.0 + area_fraction * 1.5 - distance_norm - text_like_penalty
+            oversize_ratio = comp_w * comp_h / seed_area
+            oversize_penalty = max(0.0, oversize_ratio / 4.0 - 1.0) * 0.4
+            component_score = (overlap / seed_area) * 4.0 + area_fraction * 0.5 - distance_norm - text_like_penalty - oversize_penalty
             if best_score is None or component_score > best_score:
                 best_score = component_score
                 best_box = component_box
@@ -2575,7 +2579,7 @@ async def main():
     parser.add_argument(
         "--figure_layout_device",
         type=str,
-        default="auto",
+        default="cpu",
         help="Device for the figure layout detector during markdown image extraction. Use 'auto', 'cpu', or a torch device such as 'cuda' or 'cuda:0'.",
     )
     parser.add_argument(
