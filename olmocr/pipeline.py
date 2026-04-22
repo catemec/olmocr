@@ -651,6 +651,42 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((\d+_\d+_\d+_\d+_\d+\.png)\)")
+
+
+def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, dim: int = 2048) -> None:
+    """Crop and save figure images referenced in olmocr markdown output.
+
+    The model emits references like ![caption](page_x_y_w_h.png) where the
+    coordinates are in the pixel space of the rendered page image at `dim`.
+    """
+    refs = _IMAGE_REF_RE.findall(natural_text)
+    if not refs:
+        return
+
+    page_cache: dict[int, Image.Image] = {}
+
+    for filename in refs:
+        dest = os.path.join(markdown_dir, filename)
+        if os.path.exists(dest):
+            continue
+
+        stem = os.path.splitext(filename)[0]
+        page, x, y, w, h = (int(v) for v in stem.split("_"))
+
+        if page not in page_cache:
+            b64 = render_pdf_to_base64png(pdf_path, page, target_longest_image_dim=dim)
+            page_cache[page] = Image.open(BytesIO(base64.b64decode(b64)))
+
+        img = page_cache[page]
+        iw, ih = img.size
+        left, upper = max(0, min(x, iw)), max(0, min(y, ih))
+        right, lower = max(0, min(x + w, iw)), max(0, min(y + h, ih))
+
+        if right > left and lower > upper:
+            img.crop((left, upper, right, lower)).save(dest, format="PNG")
+
+
 def get_markdown_path(workspace: str, source_file: str) -> str:
     """
     Calculate the markdown output path for a given source file.
@@ -792,6 +828,13 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                         os.makedirs(markdown_dir, exist_ok=True)
                         with open(markdown_path, "w") as md_f:
                             md_f.write(natural_text)
+
+                        # Extract figure images when the source PDF is also local
+                        if not source_file.startswith("s3://") and not source_file.startswith("gs://") and not source_file.startswith("weka://") and "::" not in source_file:
+                            try:
+                                extract_page_images(natural_text, markdown_dir, source_file)
+                            except Exception as img_err:
+                                logger.warning(f"Image extraction failed for {source_file}: {img_err}")
 
             # Update finished token counts from successful documents
             metrics.add_metrics(
