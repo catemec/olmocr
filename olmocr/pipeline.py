@@ -651,34 +651,48 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
-_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((\d+_\d+_\d+_\d+_\d+\.png)\)")
+_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_\d+_\d+_\d+_\d+\.png)\)")
 
 
-def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, dim: int = 2048) -> None:
+def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, page_spans: list | None = None, dim: int = 2048) -> None:
     """Crop and save figure images referenced in olmocr markdown output.
 
     The model emits references like ![caption](page_x_y_w_h.png) where the
     coordinates are in the pixel space of the rendered page image at `dim`.
+    Page number is determined from page_spans (list of [start, end, page_num]).
     """
-    refs = _IMAGE_REF_RE.findall(natural_text)
-    if not refs:
+    matches = list(_IMAGE_REF_RE.finditer(natural_text))
+    if not matches:
         return
 
     page_cache: dict[int, Image.Image] = {}
 
-    for filename in refs:
+    for m in matches:
+        filename = m.group(1)
         dest = os.path.join(markdown_dir, filename)
         if os.path.exists(dest):
             continue
 
-        stem = os.path.splitext(filename)[0]
-        page, x, y, w, h = (int(v) for v in stem.split("_"))
+        # filename format: page_x_y_w_h.png — "page" is a literal prefix
+        _, sx, sy, sw, sh = os.path.splitext(filename)[0].split("_")
+        x, y, w, h = int(sx), int(sy), int(sw), int(sh)
 
-        if page not in page_cache:
-            b64 = render_pdf_to_base64png(pdf_path, page, target_longest_image_dim=dim)
-            page_cache[page] = Image.open(BytesIO(base64.b64decode(b64)))
+        # Determine which PDF page this ref belongs to via character position
+        page_num = 1
+        if page_spans:
+            ref_pos = m.start()
+            for span_start, span_end, pnum in page_spans:
+                if span_start <= ref_pos < span_end:
+                    page_num = pnum
+                    break
+            else:
+                page_num = page_spans[-1][2]
 
-        img = page_cache[page]
+        if page_num not in page_cache:
+            b64 = render_pdf_to_base64png(pdf_path, page_num, target_longest_image_dim=dim)
+            page_cache[page_num] = Image.open(BytesIO(base64.b64decode(b64)))
+
+        img = page_cache[page_num]
         iw, ih = img.size
         left, upper = max(0, min(x, iw)), max(0, min(y, ih))
         right, lower = max(0, min(x + w, iw)), max(0, min(y + h, ih))
@@ -832,7 +846,8 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                         # Extract figure images when the source PDF is also local
                         if not source_file.startswith("s3://") and not source_file.startswith("gs://") and not source_file.startswith("weka://") and "::" not in source_file:
                             try:
-                                extract_page_images(natural_text, markdown_dir, source_file)
+                                page_spans = doc.get("attributes", {}).get("pdf_page_numbers")
+                                extract_page_images(natural_text, markdown_dir, source_file, page_spans=page_spans)
                             except Exception as img_err:
                                 logger.warning(f"Image extraction failed for {source_file}: {img_err}")
 
