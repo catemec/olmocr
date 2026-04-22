@@ -1820,6 +1820,13 @@ def _augment_markdown_with_detected_refs(
     return _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
 
 
+def _prefix_markdown_image_refs(natural_text: str, asset_prefix: str) -> str:
+    if not asset_prefix:
+        return natural_text
+
+    return _MARKDOWN_IMAGE_TAG_RE.sub(lambda match: f"![{match.group(1)}]({asset_prefix}/{match.group(2)})", natural_text)
+
+
 def detect_missing_figure_refs(
     natural_text: str,
     pdf_path: str,
@@ -1843,7 +1850,7 @@ def detect_missing_figure_refs(
 
 def extract_page_images(
     natural_text: str,
-    markdown_dir: str,
+    output_dir: str,
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
@@ -1896,8 +1903,10 @@ def extract_page_images(
     if not filenames:
         return
 
+    os.makedirs(output_dir, exist_ok=True)
+
     for filename in filenames:
-        dest = os.path.join(markdown_dir, filename)
+        dest = os.path.join(output_dir, filename)
         if os.path.exists(dest):
             continue
 
@@ -1972,6 +1981,12 @@ def get_markdown_path(workspace: str, source_file: str) -> str:
     markdown_path = os.path.join(markdown_dir, md_filename)
 
     return markdown_path
+
+
+def get_markdown_asset_dir(markdown_path: str) -> str:
+    markdown_dir = os.path.dirname(markdown_path)
+    markdown_stem = os.path.splitext(os.path.basename(markdown_path))[0]
+    return os.path.join(markdown_dir, markdown_stem)
 
 
 async def worker(args, work_queue: WorkQueue, worker_id):
@@ -2052,6 +2067,8 @@ async def worker(args, work_queue: WorkQueue, worker_id):
 
                     markdown_path = get_markdown_path(args.workspace, source_file)
                     markdown_dir = os.path.dirname(markdown_path)
+                    markdown_asset_dir = get_markdown_asset_dir(markdown_path)
+                    markdown_asset_prefix = os.path.basename(markdown_asset_dir)
 
                     # Create the directory structure if it doesn't exist
                     if markdown_path.startswith("s3://"):
@@ -2086,10 +2103,12 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                             natural_text = _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
                             detected_refs_by_page = {page_num: [ref.filename for ref in refs] for page_num, refs in canonical_refs_by_page.items()}
 
+                        rendered_markdown_text = _prefix_markdown_image_refs(natural_text, markdown_asset_prefix)
+
                         # For local paths, create the directory structure and write the file
                         os.makedirs(markdown_dir, exist_ok=True)
                         with open(markdown_path, "w") as md_f:
-                            md_f.write(natural_text)
+                            md_f.write(rendered_markdown_text)
 
                         # Extract figure images when the source PDF is also local
                         if (
@@ -2101,7 +2120,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                             try:
                                 extract_page_images(
                                     natural_text,
-                                    markdown_dir,
+                                    markdown_asset_dir,
                                     source_file,
                                     page_spans=page_spans,
                                     layout_model_name=args.figure_layout_model,

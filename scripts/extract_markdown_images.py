@@ -25,15 +25,17 @@ from PIL import Image
 
 from olmocr.data.renderpdf import render_pdf_to_base64png
 
-IMAGE_REF_RE = re.compile(r"!\[([^\]]*)\]\((\d+_\d+_\d+_\d+_\d+\.png)\)")
+IMAGE_REF_RE = re.compile(r"!\[([^\]]*)\]\(([^)]*page_\d+_\d+_\d+_\d+_\d+\.png)\)")
 
 
 def parse_image_filename(filename: str) -> tuple[int, int, int, int, int]:
-    """Parse 'page_x_y_w_h.png' into (page, x, y, w, h)."""
-    stem = Path(filename).stem
+    """Parse 'page_pageNum_x_y_w_h.png' into (page, x, y, w, h)."""
+    stem = Path(filename).name.rsplit(".", 1)[0]
     parts = stem.split("_")
-    page, x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
-    return page, x, y, w, h
+    if len(parts) != 6 or parts[0] != "page":
+        raise ValueError(f"Unsupported image filename: {filename}")
+    _, page, x, y, w, h = parts
+    return int(page), int(x), int(y), int(w), int(h)
 
 
 def render_page_image(pdf_path: str, page_num: int, dim: int) -> Image.Image:
@@ -53,6 +55,7 @@ def extract_images_from_markdown(md_path: Path, pdf_path: Path, dim: int) -> int
 
     for _alt, filename in refs:
         dest = out_dir / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             continue
 

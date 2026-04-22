@@ -13,6 +13,7 @@ from olmocr.pipeline import (
     DetectedFigureRef,
     LayoutDetection,
     PageResult,
+    _prefix_markdown_image_refs,
     _load_layout_detector_model,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
@@ -22,6 +23,7 @@ from olmocr.pipeline import (
     detect_page_figure_refs,
     detect_missing_figure_refs,
     extract_page_images,
+    get_markdown_asset_dir,
     get_markdown_path,
     process_page,
 )
@@ -604,8 +606,26 @@ class TestMarkdownPathHandling:
             f"BUG: Path traversal attack! Markdown path '{resolved_path}' escapes " f"workspace '{resolved_workspace}'. Paths with ../ should be sanitized."
         )
 
+    def test_markdown_asset_dir_is_scoped_per_document(self):
+        workspace = "/tmp/test_workspace"
+
+        optimizer_markdown_path = get_markdown_path(workspace, "/home/rsgarci1/myHDD/RkrishnanGehrke/Ch15_Optimizer.pdf")
+        transaction_markdown_path = get_markdown_path(workspace, "/home/rsgarci1/myHDD/RkrishnanGehrke/Ch16_Transaction.pdf")
+
+        assert get_markdown_asset_dir(optimizer_markdown_path) == "/tmp/test_workspace/markdown/home/rsgarci1/myHDD/RkrishnanGehrke/Ch15_Optimizer"
+        assert get_markdown_asset_dir(transaction_markdown_path) == "/tmp/test_workspace/markdown/home/rsgarci1/myHDD/RkrishnanGehrke/Ch16_Transaction"
+        assert get_markdown_asset_dir(optimizer_markdown_path) != get_markdown_asset_dir(transaction_markdown_path)
+
 
 class TestMarkdownImageExtraction:
+    def test_prefix_markdown_image_refs_targets_document_asset_dir(self):
+        natural_text = "Text before ![Figure A](page_1_10_20_30_40.png) and ![Figure B](page_2_11_21_31_41.png)"
+
+        rewritten = _prefix_markdown_image_refs(natural_text, "Ch16_Transaction")
+
+        assert "![Figure A](Ch16_Transaction/page_1_10_20_30_40.png)" in rewritten
+        assert "![Figure B](Ch16_Transaction/page_2_11_21_31_41.png)" in rewritten
+
     def test_qualify_markdown_image_refs_adds_page_numbers(self):
         natural_text = "Page one ![Figure A](page_10_20_30_40.png)\n\nPage two ![Figure B](page_10_20_30_40.png)"
         page_spans = [[0, 44, 1], [44, len(natural_text), 2]]
