@@ -2345,7 +2345,7 @@ def submit_beaker_job(args):
         BeakerTaskResources,
         BeakerTaskSpec,
     )
-    from beaker.exceptions import BeakerSecretNotFound
+    from beaker.exceptions import BeakerSecretNotFound  # type: ignore
 
     Beaker.TIMEOUT = 60
     b = Beaker.from_env(default_workspace=args.beaker_workspace)
@@ -2655,11 +2655,11 @@ async def main():
         cred_path = os.path.join(os.path.expanduser("~"), ".aws", "credentials")
         os.makedirs(os.path.dirname(cred_path), exist_ok=True)
         with open(cred_path, "w") as f:
-            f.write(os.environ.get("AWS_CREDENTIALS_FILE"))
+            f.write(os.environ.get("AWS_CREDENTIALS_FILE"))  # type: ignore
         cred_path = os.path.join(os.path.expanduser("~"), ".gcs", "credentials")
         os.makedirs(os.path.dirname(cred_path), exist_ok=True)
         with open(cred_path, "w") as f:
-            f.write(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_FILE"))
+            f.write(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_FILE"))  # type: ignore
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
         workspace_s3 = boto3.client("s3")
         pdf_s3 = boto3.client("s3")
@@ -2771,7 +2771,7 @@ async def main():
 
         # Add tarballs to the queue - each tarball is one work item
         if tarball_paths:
-            await work_queue.populate_queue(tarball_paths, 1)
+            await work_queue.populate_queue(tarball_paths, 1)  # type: ignore
 
     if args.stats:
         print_stats(args, work_queue)
@@ -2831,7 +2831,7 @@ async def main():
     # Wait for cancelled tasks to complete
     tasks_to_wait = [metrics_task]
     if vllm_server is not None:
-        tasks_to_wait.append(vllm_server)
+        tasks_to_wait.append(vllm_server)  # type: ignore
     await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
     # Output final metrics summary
