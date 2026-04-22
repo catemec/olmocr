@@ -33,12 +33,12 @@ from olmocr.check import (
     check_poppler_version,
     check_torch_gpu_available,
 )
-from olmocr.data.renderpdf import render_pdf_to_base64png
+from olmocr.data.renderpdf import get_png_dimensions_from_base64, render_pdf_to_base64png
 from olmocr.filter.filter import Language, PdfFilter
 from olmocr.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
 from olmocr.metrics import MetricsKeeper, WorkerTracker
 from olmocr.prompts import PageResponse, build_no_anchoring_v4_yaml_prompt
-from olmocr.prompts.anchor import get_anchor_text
+from olmocr.prompts.anchor import _pdf_report, get_anchor_text
 from olmocr.s3_utils import (
     download_directory,
     download_zstd_csv,
@@ -136,7 +136,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": build_no_anchoring_v4_yaml_prompt()},
+                    {"type": "text", "text": build_no_anchoring_v4_yaml_prompt(*get_png_dimensions_from_base64(image_base64))},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
                 ],
             }
@@ -654,18 +654,77 @@ def build_dolma_document(pdf_orig_path, page_results):
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_\d+_\d+_\d+_\d+\.png)\)")
 
 
+def _anchor_crop(model_x: int, model_y: int, model_w: int, model_h: int, iw: int, ih: int, pdf_path: str, page_num: int, report_cache: dict) -> tuple[int, int, int, int]:
+    """Try to refine the model's approximate pixel bbox using anchor-detected image elements.
+
+    For raster images embedded in the PDF the anchor system has exact positions;
+    we convert them from PDF coordinates (lower-left origin, points) to PIL pixel
+    space and return whichever anchor bbox overlaps most with the model's estimate.
+    Falls back to the model's coordinates when no good match exists.
+    """
+    if page_num not in report_cache:
+        try:
+            report_cache[page_num] = _pdf_report(pdf_path, page_num)
+        except Exception:
+            report_cache[page_num] = None
+
+    report = report_cache[page_num]
+    if report and report.image_elements:
+        pw = report.mediabox.x1 - report.mediabox.x0
+        ph = report.mediabox.y1 - report.mediabox.y0
+        sx = iw / pw
+        sy = ih / ph
+
+        best_overlap = 0
+        best_box: tuple[int, int, int, int] | None = None
+
+        for elem in report.image_elements:
+            # PDF coords: lower-left origin → PIL: top-left origin
+            a_left = int((elem.bbox.x0 - report.mediabox.x0) * sx)
+            a_right = int((elem.bbox.x1 - report.mediabox.x0) * sx)
+            a_upper = int((ph - (elem.bbox.y1 - report.mediabox.y0)) * sy)
+            a_lower = int((ph - (elem.bbox.y0 - report.mediabox.y0)) * sy)
+
+            ov_w = max(0, min(model_x + model_w, a_right) - max(model_x, a_left))
+            ov_h = max(0, min(model_y + model_h, a_lower) - max(model_y, a_upper))
+            overlap = ov_w * ov_h
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_box = (a_left, a_upper, a_right, a_lower)
+
+        model_area = model_w * model_h
+        if best_box and model_area > 0 and best_overlap / model_area > 0.1:
+            return (
+                max(0, min(best_box[0], iw)),
+                max(0, min(best_box[1], ih)),
+                max(0, min(best_box[2], iw)),
+                max(0, min(best_box[3], ih)),
+            )
+
+    # Fallback: model's pixel coordinates (top-left origin)
+    return (
+        max(0, min(model_x, iw)),
+        max(0, min(model_y, ih)),
+        max(0, min(model_x + model_w, iw)),
+        max(0, min(model_y + model_h, ih)),
+    )
+
+
 def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, page_spans: list | None = None, dim: int = 2048) -> None:
     """Crop and save figure images referenced in olmocr markdown output.
 
-    The model emits references like ![caption](page_x_y_w_h.png) where the
-    coordinates are in the pixel space of the rendered page image at `dim`.
-    Page number is determined from page_spans (list of [start, end, page_num]).
+    The model emits references like ![caption](page_x_y_w_h.png) where
+    startx/starty are pixel coordinates with top-left origin in the rendered
+    image.  Page number is resolved from page_spans ([start, end, page_num]).
+    For embedded raster images the crop is refined using anchor-detected bboxes.
     """
     matches = list(_IMAGE_REF_RE.finditer(natural_text))
     if not matches:
         return
 
     page_cache: dict[int, Image.Image] = {}
+    report_cache: dict = {}
 
     for m in matches:
         filename = m.group(1)
@@ -694,8 +753,8 @@ def extract_page_images(natural_text: str, markdown_dir: str, pdf_path: str, pag
 
         img = page_cache[page_num]
         iw, ih = img.size
-        left, upper = max(0, min(x, iw)), max(0, min(y, ih))
-        right, lower = max(0, min(x + w, iw)), max(0, min(y + h, ih))
+
+        left, upper, right, lower = _anchor_crop(x, y, w, h, iw, ih, pdf_path, page_num, report_cache)
 
         if right > left and lower > upper:
             img.crop((left, upper, right, lower)).save(dest, format="PNG")
