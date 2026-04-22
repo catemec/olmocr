@@ -1438,6 +1438,32 @@ def _local_component_crop(
     if refined_max_x >= refined_min_x and refined_max_y >= refined_min_y:
         best_box = (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
 
+    # Extend downward to include a caption (text lines just below the figure body).
+    # Captions are aggressively penalized by _component_text_penalty, so they never
+    # win the component-selection loop above; we tack them on here instead.
+    gap_limit = max(18, int(window_h * 0.04))   # max blank rows between figure and caption
+    inter_line_gap = 8                            # max blank rows between caption lines
+    height_limit = max(80, int(window_h * 0.18)) # max rows to absorb below figure
+    search_end = min(window_h, best_box[3] + gap_limit + height_limit)
+    blank_run = 0
+    in_caption = False
+    caption_end = None
+    for y in range(best_box[3], search_end):
+        row_offset = y * window_w
+        has_ink = any(original_foreground[row_offset + x] for x in range(window_w))
+        if has_ink:
+            if not in_caption and blank_run > gap_limit:
+                break  # too far below figure before finding any caption
+            in_caption = True
+            caption_end = y
+            blank_run = 0
+        else:
+            blank_run += 1
+            if in_caption and blank_run > inter_line_gap:
+                break  # trailing whitespace after caption text
+    if caption_end is not None:
+        best_box = (best_box[0], best_box[1], best_box[2], caption_end + 1)
+
     return _clamp_box((window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3]), iw, ih)
 
 
