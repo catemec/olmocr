@@ -654,6 +654,7 @@ def build_dolma_document(pdf_orig_path, page_results):
 
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
 _MARKDOWN_IMAGE_TAG_RE = re.compile(r"!\[([^\]]*)\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
+_FIGURE_MENTION_RE = re.compile(r"\bFigure\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -916,6 +917,91 @@ def _component_text_penalty(
     return penalty
 
 
+def _refine_component_box_to_original_foreground(
+    component_box: tuple[int, int, int, int], original_foreground: list[bool], width: int, height: int
+) -> tuple[int, int, int, int] | None:
+    refined_min_x, refined_min_y = width, height
+    refined_max_x, refined_max_y = -1, -1
+
+    for y in range(component_box[1], component_box[3]):
+        row_offset = y * width
+        for x in range(component_box[0], component_box[2]):
+            if original_foreground[row_offset + x]:
+                refined_min_x = min(refined_min_x, x)
+                refined_min_y = min(refined_min_y, y)
+                refined_max_x = max(refined_max_x, x)
+                refined_max_y = max(refined_max_y, y)
+
+    if refined_max_x < refined_min_x or refined_max_y < refined_min_y:
+        return None
+
+    return (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
+
+
+def _enumerate_page_component_boxes(img: "Image.Image") -> list[tuple[int, int, int, int]]:
+    page_width, page_height = img.size
+    gray = img.convert("L")
+    original_foreground = [value < 235 for value in gray.tobytes()]
+    mask = Image.frombytes(
+        "L",
+        (page_width, page_height),
+        bytes(255 if value else 0 for value in original_foreground),
+    )
+    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MaxFilter(5))
+
+    foreground = [value > 0 for value in mask.tobytes()]
+    visited = bytearray(page_width * page_height)
+    candidate_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    page_area = max(page_width * page_height, 1)
+
+    for start_idx, is_foreground in enumerate(foreground):
+        if not is_foreground or visited[start_idx]:
+            continue
+
+        queue = deque([start_idx])
+        visited[start_idx] = 1
+        min_x = max_x = start_idx % page_width
+        min_y = max_y = start_idx // page_width
+
+        while queue:
+            idx = queue.popleft()
+            x = idx % page_width
+            y = idx // page_width
+
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < page_width and 0 <= ny < page_height:
+                    n_idx = ny * page_width + nx
+                    if foreground[n_idx] and not visited[n_idx]:
+                        visited[n_idx] = 1
+                        queue.append(n_idx)
+
+        component_box = (min_x, min_y, max_x + 1, max_y + 1)
+        area_fraction = _box_area(component_box) / page_area
+        if area_fraction < 0.01:
+            continue
+
+        refined_box = _refine_component_box_to_original_foreground(component_box, original_foreground, page_width, page_height)
+        if refined_box is None:
+            continue
+
+        penalty = _component_text_penalty(refined_box, original_foreground, page_width, page_height)
+        if penalty >= 1.5:
+            continue
+        if not _accept_figure_candidate(refined_box, img, "page-components"):
+            continue
+
+        score = area_fraction - (penalty * 0.1)
+        candidate_boxes.append((score, refined_box))
+
+    candidate_boxes.sort(key=lambda item: (-item[0], item[1][1], item[1][0]))
+    return [box for _, box in candidate_boxes[:8]]
+
+
 def _report_looks_scanned(report) -> bool:
     if report is None or not report.image_elements:
         return False
@@ -1115,6 +1201,7 @@ def detect_page_figure_refs(
     layout_model_score_threshold: float = 0.35,
 ) -> dict[int, list[DetectedFigureRef]]:
     ref_boxes_by_page = _extract_ref_boxes_by_page(natural_text, page_spans)
+    page_text_by_number = _extract_page_texts(natural_text, page_spans)
     report_cache: dict[int, PageReport | None] = {}
     page_cache: dict[int, Image.Image] = {}
 
@@ -1171,6 +1258,34 @@ def detect_page_figure_refs(
                             discovery_source=f"vlm-ref-fallback:{crop_source}",
                         )
                     )
+
+        figure_mentions = _count_page_figure_mentions(page_text_by_number.get(page_num, ""))
+        if figure_mentions > len(page_refs):
+            existing_boxes = [ref.box for ref in page_refs]
+            component_candidates_added = 0
+            for component_box in _enumerate_page_component_boxes(img):
+                if any(
+                    _box_iou(component_box, existing_box) >= 0.35 or _intersection_area(component_box, existing_box) / max(_box_area(component_box), 1) >= 0.75
+                    for existing_box in existing_boxes
+                ):
+                    continue
+                existing_boxes.append(component_box)
+                page_refs.append(
+                    DetectedFigureRef(
+                        page_num=page_num,
+                        box=component_box,
+                        filename=_box_to_ref_filename(page_num, component_box),
+                        discovery_source="page-components",
+                    )
+                )
+                component_candidates_added += 1
+                if len(page_refs) >= figure_mentions:
+                    break
+
+            if component_candidates_added:
+                logger.info(
+                    f"Added {component_candidates_added} page-component figure refs on page {page_num} of {pdf_path} to match {figure_mentions} figure mentions"
+                )
 
         if page_refs:
             detected_refs_by_page[page_num] = page_refs
@@ -1454,6 +1569,16 @@ def _extract_ref_boxes_by_page(natural_text: str, page_spans: list | None = None
             page_num = _resolve_image_ref_page(match.start(), page_spans)
         page_boxes.setdefault(page_num, []).append((x, y, x + w, y + h))
     return page_boxes
+
+
+def _extract_page_texts(natural_text: str, page_spans: list | None) -> dict[int, str]:
+    if not page_spans:
+        return {1: natural_text}
+    return {page_num: natural_text[span_start:span_end] for span_start, span_end, page_num in page_spans}
+
+
+def _count_page_figure_mentions(page_text: str) -> int:
+    return len({match.lower() for match in _FIGURE_MENTION_RE.findall(page_text)})
 
 
 def _rewrite_markdown_with_detected_refs(

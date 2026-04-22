@@ -850,6 +850,138 @@ class TestMarkdownImageExtraction:
 
         assert detected == {}
 
+    def test_detect_page_figure_refs_falls_back_to_page_components_when_detector_missing(self):
+        img = Image.new("RGB", (220, 260), color="white")
+
+        # First figure near the top.
+        for x in range(55, 165):
+            for y in range(32, 38):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(72, 82):
+            for y in range(40, 98):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(138, 148):
+            for y in range(40, 98):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(92, 128):
+            for y in range(64, 74):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Caption under the first figure.
+        for x in range(78, 150):
+            for y in range(110, 116):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Second figure lower on the page.
+        for x in range(44, 178):
+            for y in range(150, 156):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(58, 68):
+            for y in range(158, 220):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(154, 164):
+            for y in range(158, 220):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(86, 138):
+            for y in range(182, 192):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Body text below both figures.
+        for line_y in (232, 242):
+            for x in range(15, 205):
+                for y in range(line_y, line_y + 4):
+                    img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 220, 260),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 220, 260))],
+        )
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
+                    detected = detect_page_figure_refs(
+                        "Figure 2.1  The Employees Entity Set\n\nFigure 2.2  The Works_In Relationship Set",
+                        "dummy.pdf",
+                        page_spans=[[0, 79, 1]],
+                        layout_model_name="mock-layout",
+                    )
+
+        assert 1 in detected
+        assert len(detected[1]) == 2
+        assert all(ref.discovery_source == "page-components" for ref in detected[1])
+
+    def test_detect_page_figure_refs_does_not_use_page_components_without_figure_mentions(self):
+        img = Image.new("RGB", (220, 260), color="white")
+        for x in range(55, 165):
+            for y in range(32, 38):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 220, 260),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 220, 260))],
+        )
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
+                    detected = detect_page_figure_refs("plain page text", "dummy.pdf", page_spans=[[0, 15, 1]], layout_model_name="mock-layout")
+
+        assert detected == {}
+
+    def test_detect_page_figure_refs_counts_unique_figure_mentions_for_page_components(self):
+        img = Image.new("RGB", (220, 260), color="white")
+
+        for x in range(55, 165):
+            for y in range(32, 38):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(72, 82):
+            for y in range(40, 98):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(138, 148):
+            for y in range(40, 98):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 220, 260),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 220, 260))],
+        )
+
+        repeated_mention_text = (
+            "Figure 2.1 The Employees Entity Set\n\n"
+            "As shown in Figure 2.1, the entity set has three attributes.\n\n"
+            "Figure 2.1 appears again in the discussion."
+        )
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
+                    detected = detect_page_figure_refs(
+                        repeated_mention_text,
+                        "dummy.pdf",
+                        page_spans=[[0, len(repeated_mention_text), 1]],
+                        layout_model_name="mock-layout",
+                    )
+
+        assert 1 in detected
+        assert len(detected[1]) == 1
+        assert detected[1][0].discovery_source == "page-components"
+
     def test_extract_page_images_saves_auto_detected_figure_without_vlm_ref(self, tmp_path):
         img = Image.new("RGB", (120, 120), color="white")
         for x in range(30, 90):
