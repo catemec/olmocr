@@ -654,7 +654,7 @@ def build_dolma_document(pdf_orig_path, page_results):
 
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
 _MARKDOWN_IMAGE_TAG_RE = re.compile(r"!\[([^\]]*)\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
-_FIGURE_MENTION_RE = re.compile(r"\bFigure\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_FIGURE_CAPTION_RE = re.compile(r"(?m)^\s*Figure\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -856,12 +856,18 @@ def _accept_figure_candidate(box: tuple[int, int, int, int], img: Image.Image, s
     page_width, page_height = img.size
     width = box[2] - box[0]
     height = box[3] - box[1]
+    area_fraction = _box_area(box) / max(page_width * page_height, 1)
     if width <= 0 or height <= 0:
         return False
     if _is_page_sized_box(box, page_width, page_height):
         return False
     if source.startswith("pdf-anchor"):
         return True
+    if source == "page-components":
+        if area_fraction < 0.015:
+            return False
+        if width < int(page_width * 0.15) or height < max(24, int(page_height * 0.085)):
+            return False
     if width < max(20, int(page_width * 0.025)) or height < max(20, int(page_height * 0.025)):
         return False
     return not _is_probable_text_fragment(box, img)
@@ -1578,7 +1584,7 @@ def _extract_page_texts(natural_text: str, page_spans: list | None) -> dict[int,
 
 
 def _count_page_figure_mentions(page_text: str) -> int:
-    return len({match.lower() for match in _FIGURE_MENTION_RE.findall(page_text)})
+    return len({match.lower() for match in _FIGURE_CAPTION_RE.findall(page_text)})
 
 
 def _rewrite_markdown_with_detected_refs(
