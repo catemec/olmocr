@@ -1564,6 +1564,22 @@ def _get_page_qualified_image_ref(filename: str, ref_pos: int, page_spans: list 
     return f"page_{page_num}_{x}_{y}_{w}_{h}.png"
 
 
+def _qualify_page_markdown_image_refs(natural_text: str, page_num: int) -> str:
+    matches = list(_IMAGE_REF_RE.finditer(natural_text))
+    if not matches:
+        return natural_text
+
+    output_parts = []
+    last_index = 0
+    for match in matches:
+        output_parts.append(natural_text[last_index : match.start(1)])
+        _, x, y, w, h = _parse_image_ref_filename(match.group(1))
+        output_parts.append(f"page_{page_num}_{x}_{y}_{w}_{h}.png")
+        last_index = match.end(1)
+    output_parts.append(natural_text[last_index:])
+    return "".join(output_parts)
+
+
 def _qualify_markdown_image_refs(natural_text: str, page_spans: list | None = None) -> str:
     matches = list(_IMAGE_REF_RE.finditer(natural_text))
     if not matches:
@@ -1577,6 +1593,26 @@ def _qualify_markdown_image_refs(natural_text: str, page_spans: list | None = No
         last_index = match.end(1)
     output_parts.append(natural_text[last_index:])
     return "".join(output_parts)
+
+
+def _qualify_markdown_image_refs_with_page_spans(natural_text: str, page_spans: list | None = None) -> tuple[str, list | None]:
+    if not page_spans:
+        return _qualify_markdown_image_refs(natural_text, page_spans), page_spans
+
+    qualified_parts = []
+    qualified_page_spans = []
+    current_char_pos = 0
+
+    for span_start, span_end, page_num in page_spans:
+        page_text = natural_text[span_start:span_end]
+        qualified_page_text = _qualify_page_markdown_image_refs(page_text, page_num)
+        qualified_parts.append(qualified_page_text)
+
+        next_char_pos = current_char_pos + len(qualified_page_text)
+        qualified_page_spans.append([current_char_pos, next_char_pos, page_num])
+        current_char_pos = next_char_pos
+
+    return "".join(qualified_parts), qualified_page_spans
 
 
 def _extract_ref_boxes_by_page(natural_text: str, page_spans: list | None = None) -> dict[int, list[tuple[int, int, int, int]]]:
@@ -1917,7 +1953,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                 for doc in dolma_docs:
                     source_file = doc["metadata"]["Source-File"]
                     page_spans = doc.get("attributes", {}).get("pdf_page_numbers")
-                    natural_text = _qualify_markdown_image_refs(doc["text"], page_spans)
+                    natural_text, page_spans = _qualify_markdown_image_refs_with_page_spans(doc["text"], page_spans)
                     detected_refs_by_page: dict[int, list[str]] | None = None
 
                     markdown_path = get_markdown_path(args.workspace, source_file)

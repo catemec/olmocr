@@ -16,6 +16,7 @@ from olmocr.pipeline import (
     _load_layout_detector_model,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
+    _qualify_markdown_image_refs_with_page_spans,
     _rewrite_markdown_with_detected_refs,
     build_page_query,
     detect_page_figure_refs,
@@ -614,6 +615,50 @@ class TestMarkdownImageExtraction:
         assert "page_1_10_20_30_40.png" in qualified
         assert "page_2_10_20_30_40.png" in qualified
         assert qualified.count("page_10_20_30_40.png") == 0
+
+    def test_qualify_markdown_image_refs_with_page_spans_rebuilds_offsets(self):
+        natural_text = "Page one ![Figure A](page_10_20_30_40.png)\n\n" "Page two ![Figure B](page_10_20_30_40.png)"
+        page_spans = [[0, 44, 1], [44, len(natural_text), 2]]
+
+        qualified, qualified_page_spans = _qualify_markdown_image_refs_with_page_spans(natural_text, page_spans)
+
+        assert qualified == ("Page one ![Figure A](page_1_10_20_30_40.png)\n\n" "Page two ![Figure B](page_2_10_20_30_40.png)")
+        assert qualified_page_spans == [[0, 46, 1], [46, len(qualified), 2]]
+
+    def test_rewrite_markdown_with_detected_refs_uses_rebuilt_page_spans_after_qualification(self):
+        page_one_text = "Page one ![Figure A](page_10_20_30_40.png)\n\n" "The entity sets that participate in a relationship set need not be distinct. Since"
+        page_two_text = "employees report to other employees."
+        natural_text = page_one_text + page_two_text
+        page_spans = [[0, len(page_one_text), 1], [len(page_one_text), len(natural_text), 2]]
+
+        qualified_text, qualified_page_spans = _qualify_markdown_image_refs_with_page_spans(natural_text, page_spans)
+        rewritten = _rewrite_markdown_with_detected_refs(
+            qualified_text,
+            qualified_page_spans,
+            {
+                1: [
+                    DetectedFigureRef(
+                        page_num=1,
+                        box=(10, 20, 40, 60),
+                        filename="page_1_10_20_30_40.png",
+                        discovery_source="layout-detector",
+                    )
+                ],
+                2: [
+                    DetectedFigureRef(
+                        page_num=2,
+                        box=(10, 20, 40, 60),
+                        filename="page_2_10_20_30_40.png",
+                        discovery_source="layout-detector",
+                    )
+                ],
+            },
+        )
+
+        assert "Since\n\n![Figure A](page_1_10_20_30_40.png)" in rewritten
+        assert "employees report to other employees.\n\n![Figure](page_2_10_20_30_40.png)" in rewritten
+        assert "Sin\n\n![Figure A](page_1_10_20_30_40.png)" not in rewritten
+        assert rewritten.count("ce employees report to other employees.") == 0
 
     def test_extract_page_images_uses_anchor_bbox(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")
