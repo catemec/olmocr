@@ -1492,6 +1492,16 @@ def _refine_figure_crop(
     iw, ih = img.size
     model_box = _clamp_box((model_x, model_y, model_x + model_w, model_y + model_h), iw, ih)
 
+    def _collapses_seed_box(candidate_box: tuple[int, int, int, int], seed_box: tuple[int, int, int, int]) -> bool:
+        seed_w = max(seed_box[2] - seed_box[0], 1)
+        seed_h = max(seed_box[3] - seed_box[1], 1)
+        cand_w = max(candidate_box[2] - candidate_box[0], 1)
+        cand_h = max(candidate_box[3] - candidate_box[1], 1)
+
+        width_ratio = cand_w / seed_w
+        height_ratio = cand_h / seed_h
+        return (width_ratio < 0.65 and height_ratio >= 0.75) or (height_ratio < 0.65 and width_ratio >= 0.75)
+
     def _with_caption(candidate_box: tuple[int, int, int, int], source: str) -> tuple[tuple[int, int, int, int], str]:
         return _extend_box_to_caption(candidate_box, img), source
 
@@ -1507,6 +1517,8 @@ def _refine_figure_crop(
                 lx, ly = _proportional_margin(layout_box)
                 refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, lx, ly, iw, ih))
                 if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
+                    if _collapses_seed_box(refined_layout_box, model_box):
+                        return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
                     return _with_caption(refined_layout_box, "layout-detector-refined")
                 return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
         except Exception as exc:
@@ -1514,6 +1526,8 @@ def _refine_figure_crop(
 
     local_box = _local_component_crop(model_box, img)
     if local_box is not None:
+        if _collapses_seed_box(local_box, model_box):
+            return _with_caption(model_box, "model-bbox")
         return _with_caption(local_box, "local-components")
 
     if anchor_box is not None and not _is_page_sized_box(anchor_box, iw, ih):

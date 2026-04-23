@@ -916,6 +916,45 @@ class TestMarkdownImageExtraction:
         assert cropped.size[1] < 100
         assert cropped.size[1] > 80
 
+    def test_extract_page_images_avoids_single_axis_collapse_for_multi_panel_figure(self, tmp_path):
+        img = Image.new("RGB", (220, 160), color="white")
+
+        for x in range(42, 82):
+            for y in range(42, 104):
+                img.putpixel((x, y), (0, 0, 0))
+
+        for x in range(128, 168):
+            for y in range(42, 104):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 220, 160),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 220, 160))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.94, box=(30, 30, 180, 110))]
+
+        natural_text = "![Figure](page_1_30_30_150_80.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_30_30_150_80.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[0] >= 140
+        assert cropped.size[1] >= 75
+
     def test_detect_missing_figure_refs_finds_layout_figure_without_vlm_ref(self):
         img = Image.new("RGB", (120, 120), color="white")
         for x in range(30, 90):
