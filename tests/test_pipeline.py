@@ -95,10 +95,18 @@ class TestFigureLayoutDetectorLoading:
         assert caught == []
 
     def test_normalize_layout_backend_aliases(self):
+        assert _normalize_layout_backend(None) == "doclayout-yolo"
         assert _normalize_layout_backend("huggingface") == "transformers"
         assert _normalize_layout_backend("hf") == "transformers"
         assert _normalize_layout_backend("doclayout") == "doclayout-yolo"
         assert _normalize_layout_backend("yolo") == "doclayout-yolo"
+
+    def test_get_figure_layout_detector_uses_doclayout_yolo_backend_by_default(self):
+        with patch("olmocr.pipeline.DocLayoutYoloFigureLayoutDetector", return_value="yolo-detector") as mock_ctor:
+            detector = get_figure_layout_detector("dummy-layout-model", "cpu", 0.35)
+
+        assert detector == "yolo-detector"
+        mock_ctor.assert_called_once_with("dummy-layout-model", "cpu", 0.35)
 
     def test_get_figure_layout_detector_uses_transformers_backend(self):
         with patch("olmocr.pipeline.FigureLayoutDetector", return_value="transformers-detector") as mock_ctor:

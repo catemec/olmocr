@@ -700,7 +700,7 @@ def _load_layout_detector_model(model_loader, model_name: str):
 
 
 def _normalize_layout_backend(backend: str | None) -> str:
-    normalized = (backend or "transformers").strip().lower().replace("_", "-")
+    normalized = (backend or "doclayout-yolo").strip().lower().replace("_", "-")
     if normalized in {"hf", "huggingface"}:
         return "transformers"
     if normalized in {"doclayout", "doclayout-yolo", "yolo"}:
@@ -792,7 +792,7 @@ class DocLayoutYoloFigureLayoutDetector:
 
 @cache
 def get_figure_layout_detector(
-    model_name: str | None, device: str, score_threshold: float, backend: str = "transformers"
+    model_name: str | None, device: str, score_threshold: float, backend: str = "doclayout-yolo"
 ) -> FigureLayoutDetector | DocLayoutYoloFigureLayoutDetector | None:
     if not model_name or model_name.lower() == "none":
         return None
@@ -1400,7 +1400,7 @@ def detect_page_figure_refs(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
-    layout_model_backend: str = "transformers",
+    layout_model_backend: str = "doclayout-yolo",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -1904,7 +1904,7 @@ def detect_missing_figure_refs(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
-    layout_model_backend: str = "transformers",
+    layout_model_backend: str = "doclayout-yolo",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -1928,7 +1928,7 @@ def extract_page_images(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
-    layout_model_backend: str = "transformers",
+    layout_model_backend: str = "doclayout-yolo",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -2669,13 +2669,13 @@ async def main():
     parser.add_argument(
         "--figure_layout_backend",
         type=str,
-        default="transformers",
+        default="doclayout-yolo",
         help="Backend for figure layout detection during markdown image extraction. Supported values: 'transformers' and 'doclayout-yolo'.",
     )
     parser.add_argument(
         "--figure_layout_model",
         type=str,
-        default="Aryn/deformable-detr-DocLayNet",
+        default="juliozhao/DocLayout-YOLO-DocStructBench",
         help="Optional layout detection model used to localize figures on scanned markdown pages. Set to 'none' to disable.",
     )
     parser.add_argument(
