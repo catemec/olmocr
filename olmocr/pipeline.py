@@ -1421,7 +1421,12 @@ def _enumerate_page_figure_refs(
         try:
             for detection in detector.detect(img):
                 mx, my = _proportional_margin(detection.box)
-                refined = _local_component_crop(detection.box, img, window_box=_expand_box(detection.box, mx, my, iw, ih))
+                refined = _local_component_crop(
+                    detection.box,
+                    img,
+                    window_box=_expand_box(detection.box, mx, my, iw, ih),
+                    trim_to_foreground=False,
+                )
                 candidate = refined if refined is not None else detection.box
                 normalized = _normalize_box(candidate, iw, ih)
                 if normalized is None:
@@ -1559,6 +1564,7 @@ def _local_component_crop(
     img: "Image.Image",
     window_box: tuple[int, int, int, int] | None = None,
     seed_box: tuple[int, int, int, int] | None = None,
+    trim_to_foreground: bool = True,
 ) -> tuple[int, int, int, int] | None:
     iw, ih = img.size
     if window_box is None:
@@ -1675,9 +1681,10 @@ def _local_component_crop(
     if best_box_area > seed_area * 6 or _is_page_sized_box(abs_best_box, iw, ih, min_fraction=0.35):
         return None
 
-    refined = _refine_component_box_to_original_foreground(best_box, original_foreground)
-    if refined is not None:
-        best_box = refined
+    if trim_to_foreground:
+        refined = _refine_component_box_to_original_foreground(best_box, original_foreground)
+        if refined is not None:
+            best_box = refined
 
     return _clamp_box((window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3]), iw, ih)
 
@@ -1727,6 +1734,7 @@ def _refine_figure_crop(
                     img,
                     window_box=_expand_box(layout_box, lx, ly, iw, ih),
                     seed_box=layout_box,
+                    trim_to_foreground=False,
                 )
                 if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
                     if _collapses_seed_box(refined_layout_box, model_box):
