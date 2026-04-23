@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from olmocr.pipeline import (
+    DocLayoutYoloFigureLayoutDetector,
     DetectedFigureRef,
     LayoutDetection,
     PageResult,
@@ -17,6 +18,7 @@ from olmocr.pipeline import (
     _strip_junk_figure_refs,
     _vlm_verify_is_figure,
     _load_layout_detector_model,
+    _normalize_layout_backend,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
     _qualify_markdown_image_refs_with_page_spans,
@@ -25,6 +27,7 @@ from olmocr.pipeline import (
     detect_page_figure_refs,
     detect_missing_figure_refs,
     extract_page_images,
+    get_figure_layout_detector,
     get_markdown_asset_dir,
     get_markdown_path,
     process_page,
@@ -90,6 +93,67 @@ class TestFigureLayoutDetectorLoading:
 
         assert loaded == {"model_name": "dummy-layout-model"}
         assert caught == []
+
+    def test_normalize_layout_backend_aliases(self):
+        assert _normalize_layout_backend("huggingface") == "transformers"
+        assert _normalize_layout_backend("hf") == "transformers"
+        assert _normalize_layout_backend("doclayout") == "doclayout-yolo"
+        assert _normalize_layout_backend("yolo") == "doclayout-yolo"
+
+    def test_get_figure_layout_detector_uses_transformers_backend(self):
+        with patch("olmocr.pipeline.FigureLayoutDetector", return_value="transformers-detector") as mock_ctor:
+            detector = get_figure_layout_detector("dummy-layout-model", "cpu", 0.35, "transformers")
+
+        assert detector == "transformers-detector"
+        mock_ctor.assert_called_once_with("dummy-layout-model", "cpu", 0.35)
+
+    def test_get_figure_layout_detector_uses_doclayout_yolo_backend(self):
+        with patch("olmocr.pipeline.DocLayoutYoloFigureLayoutDetector", return_value="yolo-detector") as mock_ctor:
+            detector = get_figure_layout_detector("dummy-layout-model", "cpu", 0.35, "doclayout-yolo")
+
+        assert detector == "yolo-detector"
+        mock_ctor.assert_called_once_with("dummy-layout-model", "cpu", 0.35)
+
+    def test_get_figure_layout_detector_returns_none_for_unsupported_backend(self):
+        detector = get_figure_layout_detector("dummy-layout-model", "cpu", 0.35, "unsupported-backend")
+        assert detector is None
+
+    def test_doclayout_yolo_detector_filters_non_figure_labels(self):
+        class FakeTensor:
+            def __init__(self, values):
+                self._values = values
+
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return self._values
+
+        class FakeBoxes:
+            xyxy = FakeTensor([[10.2, 20.4, 80.1, 120.7], [1.0, 2.0, 3.0, 4.0]])
+            conf = FakeTensor([0.92, 0.88])
+            cls = FakeTensor([0, 1])
+
+        class FakeResult:
+            boxes = FakeBoxes()
+            names = {0: "figure", 1: "text"}
+
+        class FakeYOLO:
+            @staticmethod
+            def from_pretrained(model_name):
+                return FakeYOLO()
+
+            def predict(self, image, conf, device, verbose=False):
+                return [FakeResult()]
+
+        with patch.dict("sys.modules", {"doclayout_yolo": type("M", (), {"YOLOv10": FakeYOLO})()}):
+            detector = DocLayoutYoloFigureLayoutDetector("dummy-layout-model", "cpu", 0.35)
+
+        detections = detector.detect(Image.new("RGB", (100, 120), color="white"))
+        assert detections == [LayoutDetection(label="figure", score=0.92, box=(10, 20, 80, 121))]
 
 
 class TestImageRotation:

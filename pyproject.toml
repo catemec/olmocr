@@ -53,6 +53,7 @@ olmocr = "olmocr.pipeline:cli_main"
 gpu = [
     "torch>=2.7.0",
     "transformers==4.57.3",
+    "doclayout-yolo",
     "timm",
     "vllm==0.11.2"
 ]

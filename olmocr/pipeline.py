@@ -699,6 +699,15 @@ def _load_layout_detector_model(model_loader, model_name: str):
         return model_loader.from_pretrained(model_name)
 
 
+def _normalize_layout_backend(backend: str | None) -> str:
+    normalized = (backend or "transformers").strip().lower().replace("_", "-")
+    if normalized in {"hf", "huggingface"}:
+        return "transformers"
+    if normalized in {"doclayout", "doclayout-yolo", "yolo"}:
+        return "doclayout-yolo"
+    return normalized
+
+
 class FigureLayoutDetector:
     FIGURE_LABEL_TOKENS = ("picture", "figure", "chart", "diagram", "graphic", "image")
 
@@ -738,8 +747,53 @@ class FigureLayoutDetector:
         return detections
 
 
+class DocLayoutYoloFigureLayoutDetector:
+    FIGURE_LABEL_TOKENS = FigureLayoutDetector.FIGURE_LABEL_TOKENS
+
+    def __init__(self, model_name: str, device: str, score_threshold: float):
+        import torch
+        from doclayout_yolo import YOLOv10
+
+        resolved_device = _resolve_layout_device(device, torch)
+        self.device = resolved_device
+        self.score_threshold = score_threshold
+
+        if hasattr(YOLOv10, "from_pretrained"):
+            self.model = YOLOv10.from_pretrained(model_name)
+        else:
+            self.model = YOLOv10(model_name)
+
+    def detect(self, image: "Image.Image") -> list[LayoutDetection]:
+        results = self.model.predict(np.asarray(image), conf=self.score_threshold, device=self.device, verbose=False)
+        if not results:
+            return []
+
+        result = results[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return []
+
+        names = getattr(result, "names", None) or getattr(self.model, "names", {})
+        xyxy = boxes.xyxy.detach().cpu().tolist()
+        confidences = boxes.conf.detach().cpu().tolist()
+        classes = boxes.cls.detach().cpu().tolist()
+
+        detections: list[LayoutDetection] = []
+        for score, label, box in zip(confidences, classes, xyxy):
+            label_name = str(names.get(int(label), int(label))).lower() if isinstance(names, dict) else str(names[int(label)]).lower()
+            if not any(token in label_name for token in self.FIGURE_LABEL_TOKENS):
+                continue
+
+            x0, y0, x1, y1 = [int(round(v)) for v in box]
+            detections.append(LayoutDetection(label=label_name, score=float(score), box=(x0, y0, x1, y1)))
+
+        return detections
+
+
 @cache
-def get_figure_layout_detector(model_name: str | None, device: str, score_threshold: float) -> FigureLayoutDetector | None:
+def get_figure_layout_detector(
+    model_name: str | None, device: str, score_threshold: float, backend: str = "transformers"
+) -> FigureLayoutDetector | DocLayoutYoloFigureLayoutDetector | None:
     if not model_name or model_name.lower() == "none":
         return None
 
@@ -747,9 +801,14 @@ def get_figure_layout_detector(model_name: str | None, device: str, score_thresh
         import torch
 
         resolved_device = _resolve_layout_device(device, torch)
-        return FigureLayoutDetector(model_name, resolved_device, score_threshold)
+        normalized_backend = _normalize_layout_backend(backend)
+        if normalized_backend == "transformers":
+            return FigureLayoutDetector(model_name, resolved_device, score_threshold)
+        if normalized_backend == "doclayout-yolo":
+            return DocLayoutYoloFigureLayoutDetector(model_name, resolved_device, score_threshold)
+        raise ValueError(f"Unsupported figure layout backend: {backend}")
     except Exception as exc:
-        logger.warning(f"Could not initialize figure layout detector '{model_name}', falling back to heuristic crop refinement: {exc}")
+        logger.warning(f"Could not initialize figure layout detector '{model_name}' with backend '{backend}', falling back to heuristic crop refinement: {exc}")
         return None
 
 
@@ -1284,6 +1343,7 @@ def _enumerate_page_figure_refs(
     pdf_path: str,
     page_num: int,
     report_cache: dict[int, PageReport | None],
+    layout_model_backend: str,
     layout_model_name: str | None,
     layout_model_device: str,
     layout_model_score_threshold: float,
@@ -1305,7 +1365,7 @@ def _enumerate_page_figure_refs(
                     )
                 )
 
-    detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold)
+    detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold, layout_model_backend)
     if detector is not None:
         try:
             for detection in detector.detect(img):
@@ -1340,6 +1400,7 @@ def detect_page_figure_refs(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
+    layout_model_backend: str = "transformers",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -1366,6 +1427,7 @@ def detect_page_figure_refs(
             pdf_path,
             page_num,
             report_cache,
+            layout_model_backend,
             layout_model_name,
             layout_model_device,
             layout_model_score_threshold,
@@ -1386,6 +1448,7 @@ def detect_page_figure_refs(
                     pdf_path,
                     page_num,
                     report_cache,
+                    layout_model_backend=layout_model_backend,
                     layout_model_name=layout_model_name,
                     layout_model_device=layout_model_device,
                     layout_model_score_threshold=layout_model_score_threshold,
@@ -1574,6 +1637,7 @@ def _refine_figure_crop(
     pdf_path: str,
     page_num: int,
     report_cache: dict[int, PageReport | None],
+    layout_model_backend: str,
     layout_model_name: str | None,
     layout_model_device: str,
     layout_model_score_threshold: float,
@@ -1598,7 +1662,7 @@ def _refine_figure_crop(
     if anchor_box is not None and report is not None and not _report_looks_scanned(report) and not _is_page_sized_box(anchor_box, iw, ih):
         return _with_caption(anchor_box, "pdf-anchor")
 
-    detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold)
+    detector = get_figure_layout_detector(layout_model_name, layout_model_device, layout_model_score_threshold, layout_model_backend)
     if detector is not None:
         try:
             layout_box = _pick_layout_detection(model_box, detector.detect(img))
@@ -1840,6 +1904,7 @@ def detect_missing_figure_refs(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
+    layout_model_backend: str = "transformers",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -1849,6 +1914,7 @@ def detect_missing_figure_refs(
         pdf_path,
         page_spans=page_spans,
         dim=dim,
+        layout_model_backend=layout_model_backend,
         layout_model_name=layout_model_name,
         layout_model_device=layout_model_device,
         layout_model_score_threshold=layout_model_score_threshold,
@@ -1862,6 +1928,7 @@ def extract_page_images(
     pdf_path: str,
     page_spans: list | None = None,
     dim: int = 2048,
+    layout_model_backend: str = "transformers",
     layout_model_name: str | None = None,
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
@@ -1898,6 +1965,7 @@ def extract_page_images(
                 pdf_path,
                 page_spans=page_spans,
                 dim=dim,
+                layout_model_backend=layout_model_backend,
                 layout_model_name=layout_model_name,
                 layout_model_device=layout_model_device,
                 layout_model_score_threshold=layout_model_score_threshold,
@@ -1940,6 +2008,7 @@ def extract_page_images(
             pdf_path,
             page_num,
             report_cache,
+            layout_model_backend=layout_model_backend,
             layout_model_name=layout_model_name,
             layout_model_device=layout_model_device,
             layout_model_score_threshold=layout_model_score_threshold,
@@ -2116,6 +2185,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                                 natural_text,
                                 source_file,
                                 page_spans=page_spans,
+                                layout_model_backend=args.figure_layout_backend,
                                 layout_model_name=args.figure_layout_model,
                                 layout_model_device=args.figure_layout_device,
                                 layout_model_score_threshold=args.figure_layout_score_threshold,
@@ -2143,6 +2213,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                                     markdown_asset_dir,
                                     source_file,
                                     page_spans=page_spans,
+                                    layout_model_backend=args.figure_layout_backend,
                                     layout_model_name=args.figure_layout_model,
                                     layout_model_device=args.figure_layout_device,
                                     layout_model_score_threshold=args.figure_layout_score_threshold,
@@ -2596,10 +2667,16 @@ async def main():
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
     parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
     parser.add_argument(
+        "--figure_layout_backend",
+        type=str,
+        default="transformers",
+        help="Backend for figure layout detection during markdown image extraction. Supported values: 'transformers' and 'doclayout-yolo'.",
+    )
+    parser.add_argument(
         "--figure_layout_model",
         type=str,
         default="Aryn/deformable-detr-DocLayNet",
-        help="Optional Hugging Face layout detection model used to localize figures on scanned markdown pages. Set to 'none' to disable.",
+        help="Optional layout detection model used to localize figures on scanned markdown pages. Set to 'none' to disable.",
     )
     parser.add_argument(
         "--figure_layout_device",
