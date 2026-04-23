@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import atexit
 import base64
-from collections import deque
 import datetime
 import hashlib
 import json
@@ -25,10 +24,12 @@ from urllib.parse import urlparse
 
 import boto3
 import httpx
+import numpy as np
 from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
-from PIL import Image, ImageFilter
+from PIL import Image
 from pypdf import PdfReader
+from scipy.ndimage import binary_dilation, find_objects, label as scipy_label
 from tqdm import tqdm
 
 from olmocr.check import (
@@ -818,16 +819,17 @@ def _append_deduped_box(existing_boxes: list[tuple[int, int, int, int]], candida
     return True
 
 
-def _count_true_runs(values: list[bool]) -> int:
-    runs = 0
-    in_run = False
-    for value in values:
-        if value and not in_run:
-            runs += 1
-            in_run = True
-        elif not value:
-            in_run = False
-    return runs
+# 4-connectivity for connected-component labeling (diagonal neighbors excluded).
+_CONNECTIVITY_4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+# 5x5 box structuring element for foreground dilation (equivalent to PIL MaxFilter(5)).
+_DILATE_5X5 = np.ones((5, 5), dtype=bool)
+
+
+def _count_true_runs_np(mask: np.ndarray) -> int:
+    if mask.size == 0:
+        return 0
+    prev = np.concatenate(([False], mask[:-1]))
+    return int(np.logical_and(mask, ~prev).sum())
 
 
 def _is_probable_text_fragment(box: tuple[int, int, int, int], img: Image.Image) -> bool:
@@ -843,30 +845,16 @@ def _is_probable_text_fragment(box: tuple[int, int, int, int], img: Image.Image)
     if area_fraction >= 0.004 or aspect_ratio < 6.0 or height > max(64, int(page_height * 0.12)):
         return False
 
-    crop = img.crop((left, upper, right, lower)).convert("L")
-    threshold_table = [255 if pixel > 235 else 0 for pixel in range(256)]
-    mask = crop.point(threshold_table, mode="1")
-    pixels = mask.tobytes()
-    row_active: list[bool] = []
-    col_active: list[bool] = []
+    crop = np.asarray(img.crop((left, upper, right, lower)).convert("L"))
+    ink = crop <= 235
+    row_ink = ink.sum(axis=1)
+    col_ink = ink.sum(axis=0)
+    row_active = row_ink >= max(1, int(width * 0.02))
+    col_active = col_ink >= max(1, int(height * 0.02))
 
-    for row in range(height):
-        ink_pixels = 0
-        for col in range(width):
-            if pixels[row * width + col] == 0:
-                ink_pixels += 1
-        row_active.append(ink_pixels >= max(1, int(width * 0.02)))
-
-    for col in range(width):
-        ink_pixels = 0
-        for row in range(height):
-            if pixels[row * width + col] == 0:
-                ink_pixels += 1
-        col_active.append(ink_pixels >= max(1, int(height * 0.02)))
-
-    row_runs = _count_true_runs(row_active)
-    col_runs = _count_true_runs(col_active)
-    active_rows = sum(row_active)
+    row_runs = _count_true_runs_np(row_active)
+    col_runs = _count_true_runs_np(col_active)
+    active_rows = int(row_active.sum())
     return row_runs <= 3 and col_runs <= 2 and active_rows <= max(12, int(height * 0.45))
 
 
@@ -893,40 +881,27 @@ def _accept_figure_candidate(box: tuple[int, int, int, int], img: Image.Image, s
 
 def _component_text_penalty(
     component_box: tuple[int, int, int, int],
-    original_foreground: list[bool],
+    foreground_2d: np.ndarray,
     window_w: int,
     window_h: int,
 ) -> float:
-    comp_w = max(component_box[2] - component_box[0], 1)
-    comp_h = max(component_box[3] - component_box[1], 1)
+    x0, y0, x1, y1 = component_box
+    comp_w = max(x1 - x0, 1)
+    comp_h = max(y1 - y0, 1)
     aspect_ratio = comp_w / comp_h
-    ink_pixels = 0
-    dense_rows = 0
-    dense_cols = 0
 
-    for y in range(component_box[1], component_box[3]):
-        row_ink = 0
-        row_offset = y * window_w
-        for x in range(component_box[0], component_box[2]):
-            if original_foreground[row_offset + x]:
-                ink_pixels += 1
-                row_ink += 1
-        if row_ink >= max(1, int(comp_w * 0.18)):
-            dense_rows += 1
-
-    for x in range(component_box[0], component_box[2]):
-        col_ink = 0
-        for y in range(component_box[1], component_box[3]):
-            if original_foreground[y * window_w + x]:
-                col_ink += 1
-        if col_ink >= max(1, int(comp_h * 0.18)):
-            dense_cols += 1
+    sub = foreground_2d[y0:y1, x0:x1]
+    ink_pixels = int(sub.sum())
+    row_ink = sub.sum(axis=1)
+    col_ink = sub.sum(axis=0)
+    dense_rows = int((row_ink >= max(1, int(comp_w * 0.18))).sum())
+    dense_cols = int((col_ink >= max(1, int(comp_h * 0.18))).sum())
 
     dense_row_fraction = dense_rows / comp_h
     dense_col_fraction = dense_cols / comp_w
     fill_ratio = ink_pixels / max(comp_w * comp_h, 1)
-    touches_top_edge = component_box[1] <= max(2, int(window_h * 0.02))
-    touches_bottom_edge = component_box[3] >= window_h - max(2, int(window_h * 0.02))
+    touches_top_edge = y0 <= max(2, int(window_h * 0.02))
+    touches_bottom_edge = y1 >= window_h - max(2, int(window_h * 0.02))
 
     penalty = 0.0
     if aspect_ratio >= 2.5 and dense_row_fraction >= 0.18 and dense_col_fraction <= 0.35:
@@ -942,74 +917,49 @@ def _component_text_penalty(
 
 
 def _refine_component_box_to_original_foreground(
-    component_box: tuple[int, int, int, int], original_foreground: list[bool], width: int, height: int
+    component_box: tuple[int, int, int, int], foreground_2d: np.ndarray
 ) -> tuple[int, int, int, int] | None:
-    refined_min_x, refined_min_y = width, height
-    refined_max_x, refined_max_y = -1, -1
-
-    for y in range(component_box[1], component_box[3]):
-        row_offset = y * width
-        for x in range(component_box[0], component_box[2]):
-            if original_foreground[row_offset + x]:
-                refined_min_x = min(refined_min_x, x)
-                refined_min_y = min(refined_min_y, y)
-                refined_max_x = max(refined_max_x, x)
-                refined_max_y = max(refined_max_y, y)
-
-    if refined_max_x < refined_min_x or refined_max_y < refined_min_y:
+    x0, y0, x1, y1 = component_box
+    sub = foreground_2d[y0:y1, x0:x1]
+    if not sub.any():
         return None
-
-    return (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
+    rows = np.where(sub.any(axis=1))[0]
+    cols = np.where(sub.any(axis=0))[0]
+    return (
+        x0 + int(cols[0]),
+        y0 + int(rows[0]),
+        x0 + int(cols[-1]) + 1,
+        y0 + int(rows[-1]) + 1,
+    )
 
 
 def _enumerate_page_component_boxes(img: "Image.Image") -> list[tuple[int, int, int, int]]:
     page_width, page_height = img.size
-    gray = img.convert("L")
-    original_foreground = [value < 235 for value in gray.tobytes()]
-    mask = Image.frombytes(
-        "L",
-        (page_width, page_height),
-        bytes(255 if value else 0 for value in original_foreground),
-    )
-    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MaxFilter(5))
+    gray = np.asarray(img.convert("L"))
+    original_foreground = gray < 235
 
-    foreground = [value > 0 for value in mask.tobytes()]
-    visited = bytearray(page_width * page_height)
-    candidate_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    # Two rounds of 5x5 dilation (equivalent to the previous double MaxFilter(5)) to merge
+    # nearby diagram fragments without jumping across whitespace gaps between captions/body text.
+    dilated = binary_dilation(original_foreground, structure=_DILATE_5X5)
+    dilated = binary_dilation(dilated, structure=_DILATE_5X5)
+
+    labels, num_labels = scipy_label(dilated, structure=_CONNECTIVITY_4)
+    if num_labels == 0:
+        return []
+
     page_area = max(page_width * page_height, 1)
+    candidate_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
 
-    for start_idx, is_foreground in enumerate(foreground):
-        if not is_foreground or visited[start_idx]:
+    for sl in find_objects(labels):
+        if sl is None:
             continue
-
-        queue = deque([start_idx])
-        visited[start_idx] = 1
-        min_x = max_x = start_idx % page_width
-        min_y = max_y = start_idx // page_width
-
-        while queue:
-            idx = queue.popleft()
-            x = idx % page_width
-            y = idx // page_width
-
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
-
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                if 0 <= nx < page_width and 0 <= ny < page_height:
-                    n_idx = ny * page_width + nx
-                    if foreground[n_idx] and not visited[n_idx]:
-                        visited[n_idx] = 1
-                        queue.append(n_idx)
-
-        component_box = (min_x, min_y, max_x + 1, max_y + 1)
+        ys, xs = sl
+        component_box = (xs.start, ys.start, xs.stop, ys.stop)
         area_fraction = _box_area(component_box) / page_area
         if area_fraction < 0.01:
             continue
 
-        refined_box = _refine_component_box_to_original_foreground(component_box, original_foreground, page_width, page_height)
+        refined_box = _refine_component_box_to_original_foreground(component_box, original_foreground)
         if refined_box is None:
             continue
 
@@ -1192,19 +1142,30 @@ def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -
     if search_bottom <= lower:
         return clamped_box
 
-    gray = img.convert("L")
-    foreground = [value < 235 for value in gray.crop((search_left, lower, search_right, search_bottom)).tobytes()]
-    region_width = search_right - search_left
-    region_height = search_bottom - lower
+    gray = np.asarray(img.convert("L"))
+    region = gray[lower:search_bottom, search_left:search_right]
+    if region.size == 0:
+        return clamped_box
+
+    foreground = region < 235
+    region_height, region_width = foreground.shape
+
+    # Precompute per-row ink presence and leftmost/rightmost inky column so the
+    # caption-line walk stays in pure Python over integer arrays.
+    row_has_ink = foreground.any(axis=1)
+    first_ink = np.argmax(foreground, axis=1)
+    last_ink = region_width - 1 - np.argmax(foreground[:, ::-1], axis=1)
+    no_ink = ~row_has_ink
+    first_ink = np.where(no_ink, region_width, first_ink)
+    last_ink = np.where(no_ink, -1, last_ink)
+
     caption_lines: list[tuple[int, int, int, int]] = []
 
     y = 0
     blank_rows = 0
     lines_started = False
     while y < region_height:
-        row_offset = y * region_width
-        row_has_ink = any(foreground[row_offset + x] for x in range(region_width))
-        if not row_has_ink:
+        if not row_has_ink[y]:
             blank_rows += 1
             if not lines_started and blank_rows > gap_limit:
                 break
@@ -1216,16 +1177,9 @@ def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -
         line_top = y
         line_left = region_width
         line_right = -1
-        while y < region_height:
-            row_offset = y * region_width
-            row_has_ink = False
-            for x in range(region_width):
-                if foreground[row_offset + x]:
-                    row_has_ink = True
-                    line_left = min(line_left, x)
-                    line_right = max(line_right, x)
-            if not row_has_ink:
-                break
+        while y < region_height and row_has_ink[y]:
+            line_left = min(line_left, int(first_ink[y]))
+            line_right = max(line_right, int(last_ink[y]))
             y += 1
 
         if line_right < line_left:
@@ -1440,24 +1394,19 @@ def _local_component_crop(
     else:
         window = _clamp_box(window_box, iw, ih)
 
-    gray = img.convert("L").crop(window)
-    window_w, window_h = gray.size
+    gray = np.asarray(img.convert("L").crop(window))
+    window_h, window_w = gray.shape
     if window_w == 0 or window_h == 0:
         return None
 
     # A small dilation helps merge nearby diagram fragments without jumping across
     # the larger whitespace gaps that typically separate captions and body text.
-    original_foreground = [value < 235 for value in gray.tobytes()]
-    mask = Image.frombytes(
-        "L",
-        (window_w, window_h),
-        bytes(255 if value else 0 for value in original_foreground),
-    )
-    mask = mask.filter(ImageFilter.MaxFilter(5))
+    original_foreground = gray < 235
+    dilated = binary_dilation(original_foreground, structure=_DILATE_5X5)
 
-    pixels = mask.tobytes()
-    foreground = [value > 0 for value in pixels]
-    visited = bytearray(window_w * window_h)
+    labels, num_labels = scipy_label(dilated, structure=_CONNECTIVITY_4)
+    if num_labels == 0:
+        return None
 
     seed_local = (
         model_box[0] - window[0],
@@ -1476,33 +1425,11 @@ def _local_component_crop(
     best_box: tuple[int, int, int, int] | None = None
     best_score: float | None = None
 
-    for start_idx, is_foreground in enumerate(foreground):
-        if not is_foreground or visited[start_idx]:
+    for sl in find_objects(labels):
+        if sl is None:
             continue
-
-        queue = deque([start_idx])
-        visited[start_idx] = 1
-        min_x = max_x = start_idx % window_w
-        min_y = max_y = start_idx // window_w
-
-        while queue:
-            idx = queue.popleft()
-            x = idx % window_w
-            y = idx // window_w
-
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
-
-            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                if 0 <= nx < window_w and 0 <= ny < window_h:
-                    n_idx = ny * window_w + nx
-                    if foreground[n_idx] and not visited[n_idx]:
-                        visited[n_idx] = 1
-                        queue.append(n_idx)
-
-        component_box = (min_x, min_y, max_x + 1, max_y + 1)
+        ys, xs = sl
+        component_box = (xs.start, ys.start, xs.stop, ys.stop)
         overlap = _intersection_area(component_box, seed_expanded)
         contains_center = component_box[0] <= seed_cx <= component_box[2] and component_box[1] <= seed_cy <= component_box[3]
 
@@ -1546,19 +1473,9 @@ def _local_component_crop(
     if best_box_area > seed_area * 6 or _is_page_sized_box(abs_best_box, iw, ih, min_fraction=0.35):
         return None
 
-    refined_min_x, refined_min_y = window_w, window_h
-    refined_max_x, refined_max_y = -1, -1
-    for y in range(best_box[1], best_box[3]):
-        row_offset = y * window_w
-        for x in range(best_box[0], best_box[2]):
-            if original_foreground[row_offset + x]:
-                refined_min_x = min(refined_min_x, x)
-                refined_min_y = min(refined_min_y, y)
-                refined_max_x = max(refined_max_x, x)
-                refined_max_y = max(refined_max_y, y)
-
-    if refined_max_x >= refined_min_x and refined_max_y >= refined_min_y:
-        best_box = (refined_min_x, refined_min_y, refined_max_x + 1, refined_max_y + 1)
+    refined = _refine_component_box_to_original_foreground(best_box, original_foreground)
+    if refined is not None:
+        best_box = refined
 
     return _clamp_box((window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3]), iw, ih)
 
