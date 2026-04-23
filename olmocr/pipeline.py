@@ -956,6 +956,13 @@ def _vlm_verify_is_figure(
     return not content.startswith("n")
 
 
+def _count_true_runs_np(values: np.ndarray) -> int:
+    values = np.asarray(values, dtype=bool)
+    if values.size == 0:
+        return 0
+    return int(values[0]) + int(np.sum(values[1:] & ~values[:-1]))
+
+
 def _is_probable_text_fragment(box: tuple[int, int, int, int], img: Image.Image) -> bool:
     left, upper, right, lower = box
     width = max(0, right - left)

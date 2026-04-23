@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -14,6 +15,7 @@ from olmocr.pipeline import (
     DetectedFigureRef,
     LayoutDetection,
     PageResult,
+    _count_true_runs_np,
     _prefix_markdown_image_refs,
     _strip_junk_figure_refs,
     _vlm_verify_is_figure,
@@ -93,6 +95,10 @@ class TestFigureLayoutDetectorLoading:
 
         assert loaded == {"model_name": "dummy-layout-model"}
         assert caught == []
+
+    def test_count_true_runs_np_counts_contiguous_segments(self):
+        values = np.array([False, True, True, False, True, False, True, True, True], dtype=bool)
+        assert _count_true_runs_np(values) == 3
 
     def test_normalize_layout_backend_aliases(self):
         assert _normalize_layout_backend(None) == "doclayout-yolo"
