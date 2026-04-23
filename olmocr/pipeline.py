@@ -1462,6 +1462,32 @@ def _local_component_crop(
     if best_box is None:
         return None
 
+    # Union with additional figure parts: components that substantially overlap the seed box
+    # but are disconnected from the primary component (e.g. side-by-side panels, or label
+    # boxes at the top of a diagram separated by whitespace from the main body).
+    min_part_area = max(seed_area * 0.02, 64)
+    for sl in find_objects(labels):
+        if sl is None:
+            continue
+        ys, xs = sl
+        component_box = (xs.start, ys.start, xs.stop, ys.stop)
+        comp_area = max(_box_area(component_box), 1)
+        if comp_area < min_part_area:
+            continue
+        # Must substantially overlap the original seed (>= 20 % of component area inside seed)
+        overlap_with_seed = _intersection_area(component_box, seed_local)
+        if overlap_with_seed <= 0 or overlap_with_seed / comp_area < 0.20:
+            continue
+        # Skip text-like regions (captions, body paragraphs that happen to be inside the seed)
+        if _component_text_penalty(component_box, original_foreground, window_w, window_h) > 0.4:
+            continue
+        best_box = (
+            min(best_box[0], component_box[0]),
+            min(best_box[1], component_box[1]),
+            max(best_box[2], component_box[2]),
+            max(best_box[3], component_box[3]),
+        )
+
     # Reject components that grew far beyond the seed due to dilation connecting the figure
     # to surrounding body text.  Fall back to the caller's next strategy (anchor / model bbox).
     best_box_area = (best_box[2] - best_box[0]) * (best_box[3] - best_box[1])

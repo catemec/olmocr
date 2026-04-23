@@ -952,8 +952,53 @@ class TestMarkdownImageExtraction:
         assert output_path.exists()
 
         cropped = Image.open(output_path)
-        assert cropped.size[0] >= 140
-        assert cropped.size[1] >= 75
+        # Both horizontally-separated panels (x 42-82 and x 128-168) must be included.
+        # The union spans 168-42 = 126 px wide; allow a few pixels of rounding/margin.
+        assert cropped.size[0] >= 120
+        assert cropped.size[1] >= 55
+
+    def test_extract_page_images_avoids_top_truncation_for_stacked_diagram(self, tmp_path):
+        """Top label box separated from main diagram body (e.g. DBMS architecture figure)."""
+        img = Image.new("RGB", (300, 280), color="white")
+
+        # Top section: wide box at top of figure (Query Evaluation Engine)
+        for x in range(40, 220):
+            for y in range(30, 90):
+                img.putpixel((x, y), (0, 0, 0))
+
+        # Bottom section: wide box below a whitespace gap (DBMS body)
+        for x in range(40, 220):
+            for y in range(130, 230):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 300, 280),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 300, 280))],
+        )
+
+        # VLM correctly spans both sections; layout detector does the same
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.95, box=(30, 20, 230, 240))]
+
+        natural_text = "![Figure](page_1_30_20_200_220.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_30_20_200_220.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        # Must cover from top section (y≈30) to bottom section (y≈230): height ≥ 170 px
+        assert cropped.size[1] >= 170, f"Top section cropped off; got height {cropped.size[1]}"
 
     def test_detect_missing_figure_refs_finds_layout_figure_without_vlm_ref(self):
         img = Image.new("RGB", (120, 120), color="white")
