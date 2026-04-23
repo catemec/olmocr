@@ -1420,18 +1420,11 @@ def _enumerate_page_figure_refs(
     if detector is not None:
         try:
             for detection in detector.detect(img):
-                mx, my = _proportional_margin(detection.box)
-                refined = _local_component_crop(
-                    detection.box,
-                    img,
-                    window_box=_expand_box(detection.box, mx, my, iw, ih),
-                    trim_to_foreground=False,
-                )
-                candidate = refined if refined is not None else detection.box
+                candidate = detection.box
                 normalized = _normalize_box(candidate, iw, ih)
                 if normalized is None:
                     continue
-                source = "layout-detector-refined" if refined is not None else "layout-detector"
+                source = "layout-detector"
                 if not _accept_figure_candidate(normalized, img, source):
                     continue
                 if _append_deduped_box(candidate_boxes, normalized, iw, ih):
@@ -1728,18 +1721,6 @@ def _refine_figure_crop(
         try:
             layout_box = _pick_layout_detection(model_box, detector.detect(img))
             if layout_box is not None:
-                lx, ly = _proportional_margin(layout_box)
-                refined_layout_box = _local_component_crop(
-                    model_box,
-                    img,
-                    window_box=_expand_box(layout_box, lx, ly, iw, ih),
-                    seed_box=layout_box,
-                    trim_to_foreground=False,
-                )
-                if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
-                    if _collapses_seed_box(refined_layout_box, model_box):
-                        return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
-                    return _with_caption(refined_layout_box, "layout-detector-refined")
                 return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
         except Exception as exc:
             logger.warning(f"Figure layout detection failed for {pdf_path} page {page_num}, falling back to heuristic crop refinement: {exc}")

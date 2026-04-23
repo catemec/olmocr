@@ -933,7 +933,7 @@ class TestMarkdownImageExtraction:
         assert cropped.size[0] > 60
         assert cropped.size[1] > 60
 
-    def test_extract_page_images_refines_coarse_layout_detector_box(self, tmp_path):
+    def test_extract_page_images_uses_raw_layout_detector_box(self, tmp_path):
         img = Image.new("RGB", (160, 140), color="white")
 
         # Caption/text line above the diagram.
@@ -977,10 +977,9 @@ class TestMarkdownImageExtraction:
         assert output_path.exists()
 
         cropped = Image.open(output_path)
-        assert cropped.size[1] < 60
-        assert cropped.size[1] > 20
+        assert cropped.size == (140, 86)
 
-    def test_extract_page_images_refines_coarse_layout_detector_box_with_caption_but_without_body_text(self, tmp_path):
+    def test_extract_page_images_uses_raw_layout_detector_box_with_caption_but_without_body_text(self, tmp_path):
         img = Image.new("RGB", (220, 220), color="white")
 
         # Small page header near the top-right.
@@ -1041,9 +1040,7 @@ class TestMarkdownImageExtraction:
         assert output_path.exists()
 
         cropped = Image.open(output_path)
-        assert cropped.size[0] < 170
-        assert cropped.size[1] < 100
-        assert cropped.size[1] > 80
+        assert cropped.size == (200, 210)
 
     def test_extract_page_images_avoids_single_axis_collapse_for_multi_panel_figure(self, tmp_path):
         img = Image.new("RGB", (220, 160), color="white")
@@ -1235,11 +1232,8 @@ class TestMarkdownImageExtraction:
 
         assert 1 in detected
         assert len(detected[1]) == 1
-        assert detected[1][0].discovery_source == "layout-detector-refined"
-        assert detected[1][0].box[0] <= 32
-        assert detected[1][0].box[1] <= 42
-        assert detected[1][0].box[2] >= 88
-        assert detected[1][0].box[3] >= 92
+        assert detected[1][0].discovery_source == "layout-detector"
+        assert detected[1][0].box == (32, 42, 88, 92)
 
     def test_detect_page_figure_refs_filters_text_line_fragments(self):
         img = Image.new("RGB", (160, 160), color="white")
