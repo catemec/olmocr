@@ -916,9 +916,7 @@ def _component_text_penalty(
     return penalty
 
 
-def _refine_component_box_to_original_foreground(
-    component_box: tuple[int, int, int, int], foreground_2d: np.ndarray
-) -> tuple[int, int, int, int] | None:
+def _refine_component_box_to_original_foreground(component_box: tuple[int, int, int, int], foreground_2d: np.ndarray) -> tuple[int, int, int, int] | None:
     x0, y0, x1, y1 = component_box
     sub = foreground_2d[y0:y1, x0:x1]
     if not sub.any():
@@ -943,7 +941,7 @@ def _enumerate_page_component_boxes(img: "Image.Image") -> list[tuple[int, int, 
     dilated = binary_dilation(original_foreground, structure=_DILATE_5X5)
     dilated = binary_dilation(dilated, structure=_DILATE_5X5)
 
-    labels, num_labels = scipy_label(dilated, structure=_CONNECTIVITY_4)
+    labels, num_labels = scipy_label(dilated, structure=_CONNECTIVITY_4)  # type: ignore
     if num_labels == 0:
         return []
 
@@ -985,9 +983,7 @@ def _report_looks_scanned(report) -> bool:
         return False
 
     page_area = max((report.mediabox.x1 - report.mediabox.x0) * (report.mediabox.y1 - report.mediabox.y0), 1.0)
-    total_image_area = sum(
-        max(elem.bbox.x1 - elem.bbox.x0, 0.0) * max(elem.bbox.y1 - elem.bbox.y0, 0.0) for elem in merged_images
-    )
+    total_image_area = sum(max(elem.bbox.x1 - elem.bbox.x0, 0.0) * max(elem.bbox.y1 - elem.bbox.y0, 0.0) for elem in merged_images)
     coverage = total_image_area / page_area
 
     # Classic single-image scan.
@@ -1147,15 +1143,12 @@ def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -
     if region.size == 0:
         return clamped_box
 
-    foreground = region < 235
-    region_height, region_width = foreground.shape
+    foreground: NDArray[np.bool_] = region < 235
+    row_has_ink: NDArray[np.bool_] = np.any(foreground, axis=1)
+    first_ink: NDArray[np.intp] = np.argmax(foreground, axis=1)
+    last_ink: NDArray[np.intp] = region_width - 1 - np.argmax(foreground[:, ::-1], axis=1)
+    no_ink: NDArray[np.bool_] = ~row_has_ink
 
-    # Precompute per-row ink presence and leftmost/rightmost inky column so the
-    # caption-line walk stays in pure Python over integer arrays.
-    row_has_ink = foreground.any(axis=1)
-    first_ink = np.argmax(foreground, axis=1)
-    last_ink = region_width - 1 - np.argmax(foreground[:, ::-1], axis=1)
-    no_ink = ~row_has_ink
     first_ink = np.where(no_ink, region_width, first_ink)
     last_ink = np.where(no_ink, -1, last_ink)
 
