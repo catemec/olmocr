@@ -1351,9 +1351,10 @@ class TestJunkFigureFiltering:
     def _make_body_text_image(self, width: int = 400, height: int = 600) -> "Image.Image":
         """Synthetic body-text page: horizontal text lines spanning most of the width."""
         img = Image.new("RGB", (width, height), "white")
-        # 7px of ink every 18px, spanning the text column (every 2nd column ≈ 50 % character density)
+        # 10px of ink every 18px, spanning the text column (every 2nd column).
+        # Produces drf≈0.47, dcf≈0.43, ~28 distinct runs — clearly body text.
         line_spacing = 18
-        ink_per_line = 7
+        ink_per_line = 10
         n_lines = (height - 80) // line_spacing
         for i in range(n_lines):
             y0 = 40 + i * line_spacing
@@ -1375,6 +1376,26 @@ class TestJunkFigureFiltering:
                 img.putpixel((bx0, y), (0, 0, 0))
                 img.putpixel((bx1, y), (0, 0, 0))
         return img
+
+    def test_is_junk_figure_crop_passes_wide_labeled_diagram(self):
+        """A 3-tier labeled diagram spanning full width must NOT be classified as junk."""
+        # This simulates a "Levels of Abstraction in a DBMS" diagram:
+        # three wide horizontal bands with text labels spanning nearly the full width.
+        width, height = 1127, 384
+        img = Image.new("RGB", (width, height), "white")
+        band_h = height // 4
+        for band_idx in range(3):
+            y0 = 20 + band_idx * (band_h + 10)
+            y1 = y0 + band_h
+            # Draw a box border (top and bottom of each band)
+            for x in range(20, width - 20):
+                img.putpixel((x, y0), (0, 0, 0))
+                img.putpixel((x, y1), (0, 0, 0))
+            # A single row of label text centred inside the band (sparse)
+            text_y = (y0 + y1) // 2
+            for x in range(30, width - 30, 2):
+                img.putpixel((x, text_y), (0, 0, 0))
+        assert not _is_junk_figure_crop(img), "Wide labeled diagram must not be classified as junk"
 
     def test_is_junk_figure_crop_detects_body_text_page(self):
         junk = self._make_body_text_image()

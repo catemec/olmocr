@@ -833,7 +833,8 @@ def _is_junk_figure_crop(crop: "Image.Image") -> bool:
     Body-text crops have many horizontally-dense rows of ink (text lines) spanning
     most of the crop width.  Legitimate figures (diagrams, charts, photos) are either
     sparse or have ink concentrated in specific regions, so their dense-row fraction
-    is much lower.
+    is much lower.  Critically, body text has many *separate* text-line runs (15+),
+    whereas a labeled diagram (e.g. a 3-tier abstraction diagram) has only a handful.
     """
     w, h = crop.size
     if w < 60 or h < 60:
@@ -845,17 +846,20 @@ def _is_junk_figure_crop(crop: "Image.Image") -> bool:
     col_ink = foreground.sum(axis=0)  # ink pixels per column
 
     # A row is "text-dense" if >= 12 % of its width is foreground (typical for a text line).
-    dense_rows = int((row_ink >= max(2, int(w * 0.12))).sum())
+    dense_rows_mask = row_ink >= max(2, int(w * 0.12))
     # A column is "active" if it has ink in >= 8 % of its height.
     dense_cols = int((col_ink >= max(2, int(h * 0.08))).sum())
 
-    dense_row_fraction = dense_rows / h
+    dense_row_fraction = int(dense_rows_mask.sum()) / h
     dense_col_fraction = dense_cols / w
     fill_ratio = int(foreground.sum()) / max(w * h, 1)
+    # Number of separate runs of dense rows — body text has one per text line (15+);
+    # a labeled diagram has only a few (3–8 for the text inside each box/section).
+    dense_row_runs = _count_true_runs_np(dense_rows_mask)
 
-    # Body text: many dense lines (>= 28 % of height) spanning most of the width
-    # (>= 35 % of columns active), with a moderate overall fill (2-25 %).
-    return dense_row_fraction >= 0.28 and dense_col_fraction >= 0.35 and 0.02 <= fill_ratio <= 0.25
+    # Body text: many dense lines (>= 35 % of height), spanning most of the width
+    # (>= 35 % of columns active), with >= 15 distinct text-line runs and moderate fill.
+    return dense_row_fraction >= 0.35 and dense_col_fraction >= 0.35 and dense_row_runs >= 15 and 0.02 <= fill_ratio <= 0.25
 
 
 def _count_true_runs_np(mask: np.ndarray) -> int:
