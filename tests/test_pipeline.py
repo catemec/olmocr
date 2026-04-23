@@ -803,7 +803,44 @@ class TestMarkdownImageExtraction:
         assert output_path.exists()
 
         cropped = Image.open(output_path)
-        assert cropped.size == (30, 30)
+        assert cropped.size[0] >= 30
+        assert cropped.size[1] >= 30
+        assert cropped.size[0] <= 36
+        assert cropped.size[1] <= 34
+
+    def test_extract_page_images_adds_horizontal_context_to_refined_layout_crops(self, tmp_path):
+        img = Image.new("RGB", (160, 120), color="white")
+        for x in range(40, 100):
+            for y in range(28, 88):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 160, 120),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 160, 120))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.94, box=(40, 28, 100, 88))]
+
+        natural_text = "![Figure](page_1_40_28_60_60.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_40_28_60_60.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[0] > 60
+        assert cropped.size[1] > 60
 
     def test_extract_page_images_refines_coarse_layout_detector_box(self, tmp_path):
         img = Image.new("RGB", (160, 140), color="white")

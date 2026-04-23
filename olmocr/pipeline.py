@@ -780,6 +780,17 @@ def _expand_box(box: tuple[int, int, int, int], margin_x: int, margin_y: int, iw
     return _clamp_box((box[0] - margin_x, box[1] - margin_y, box[2] + margin_x, box[3] + margin_y), iw, ih)
 
 
+def _pad_refined_figure_crop(box: tuple[int, int, int, int], crop_source: str, iw: int, ih: int) -> tuple[int, int, int, int]:
+    if crop_source not in {"layout-detector-refined", "local-components"}:
+        return box
+
+    width = max(box[2] - box[0], 1)
+    height = max(box[3] - box[1], 1)
+    margin_x = max(2, int(width * 0.03))
+    margin_y = max(1, int(height * 0.02))
+    return _expand_box(box, margin_x, margin_y, iw, ih)
+
+
 def _proportional_margin(box: tuple[int, int, int, int], minimum: int = 24, fraction: float = 0.08) -> tuple[int, int]:
     box_w = max(box[2] - box[0], 0)
     box_h = max(box[3] - box[1], 0)
@@ -1933,6 +1944,7 @@ def extract_page_images(
             layout_model_device=layout_model_device,
             layout_model_score_threshold=layout_model_score_threshold,
         )
+        left, upper, right, lower = _pad_refined_figure_crop((left, upper, right, lower), crop_source, img.width, img.height)
 
         if right > left and lower > upper:
             crop_img = img.crop((left, upper, right, lower))
