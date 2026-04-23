@@ -1085,6 +1085,55 @@ class TestMarkdownImageExtraction:
         assert cropped.size[0] >= 120
         assert cropped.size[1] >= 55
 
+    def test_extract_page_images_uses_layout_box_as_merge_seed_for_disconnected_chart(self, tmp_path):
+        img = Image.new("RGB", (320, 180), color="white")
+
+        # Thin disconnected chart bars spread across the detector region.
+        for x0, x1, y0 in ((44, 50, 68), (82, 88, 54), (122, 128, 80), (166, 172, 44), (214, 220, 60), (252, 258, 74)):
+            for x in range(x0, x1):
+                for y in range(y0, 142):
+                    img.putpixel((x, y), (0, 0, 0))
+
+        # Baseline and a couple of numeric labels to mimic a scanned histogram.
+        for x in range(30, 282):
+            for y in range(142, 145):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(40, 53):
+            for y in range(150, 154):
+                img.putpixel((x, y), (0, 0, 0))
+        for x in range(246, 260):
+            for y in range(150, 154):
+                img.putpixel((x, y), (0, 0, 0))
+
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 320, 180),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 320, 180))],
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [LayoutDetection(label="picture", score=0.96, box=(28, 36, 280, 150))]
+
+        # Narrow VLM seed only covers the left portion of the chart.
+        natural_text = "![Figure](page_1_30_48_90_104.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=FakeDetector()):
+                    extract_page_images(natural_text, str(tmp_path), "dummy.pdf", layout_model_name="mock-layout")
+
+        output_path = tmp_path / "page_1_30_48_90_104.png"
+        assert output_path.exists()
+
+        cropped = Image.open(output_path)
+        assert cropped.size[0] >= 220
+        assert cropped.size[1] >= 90
+
     def test_extract_page_images_avoids_top_truncation_for_stacked_diagram(self, tmp_path):
         """Top label box separated from main diagram body (e.g. DBMS architecture figure)."""
         img = Image.new("RGB", (300, 280), color="white")

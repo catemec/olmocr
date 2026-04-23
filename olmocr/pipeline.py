@@ -1542,6 +1542,7 @@ def _local_component_crop(
     model_box: tuple[int, int, int, int],
     img: "Image.Image",
     window_box: tuple[int, int, int, int] | None = None,
+    seed_box: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int] | None:
     iw, ih = img.size
     if window_box is None:
@@ -1550,6 +1551,8 @@ def _local_component_crop(
         window = _expand_box(model_box, margin_x, margin_y, iw, ih)
     else:
         window = _clamp_box(window_box, iw, ih)
+
+    scoring_box = _clamp_box(seed_box if seed_box is not None else model_box, iw, ih)
 
     gray = np.asarray(img.convert("L").crop(window))
     window_h, window_w = gray.shape
@@ -1566,10 +1569,10 @@ def _local_component_crop(
         return None
 
     seed_local = (
-        model_box[0] - window[0],
-        model_box[1] - window[1],
-        model_box[2] - window[0],
-        model_box[3] - window[1],
+        scoring_box[0] - window[0],
+        scoring_box[1] - window[1],
+        scoring_box[2] - window[0],
+        scoring_box[3] - window[1],
     )
     seed_expanded = _expand_box(seed_local, 12, 12, window_w, window_h)
     seed_area = max(_box_area(seed_local), 1)
@@ -1703,7 +1706,12 @@ def _refine_figure_crop(
             layout_box = _pick_layout_detection(model_box, detector.detect(img))
             if layout_box is not None:
                 lx, ly = _proportional_margin(layout_box)
-                refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, lx, ly, iw, ih))
+                refined_layout_box = _local_component_crop(
+                    model_box,
+                    img,
+                    window_box=_expand_box(layout_box, lx, ly, iw, ih),
+                    seed_box=layout_box,
+                )
                 if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
                     if _collapses_seed_box(refined_layout_box, model_box):
                         return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
