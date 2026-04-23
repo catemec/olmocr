@@ -1414,8 +1414,8 @@ def _local_component_crop(
 ) -> tuple[int, int, int, int] | None:
     iw, ih = img.size
     if window_box is None:
-        margin_x = max(32, int((model_box[2] - model_box[0]) * 0.75))
-        margin_y = max(32, int((model_box[3] - model_box[1]) * 0.75))
+        margin_x = max(32, int((model_box[2] - model_box[0]) * 1.0))
+        margin_y = max(32, int((model_box[3] - model_box[1]) * 1.0))
         window = _expand_box(model_box, margin_x, margin_y, iw, ih)
     else:
         window = _clamp_box(window_box, iw, ih)
@@ -1517,6 +1517,13 @@ def _local_component_crop(
         best_box = nearest_box
 
     if best_box is None:
+        return None
+
+    # Reject components that grew far beyond the seed due to dilation connecting the figure
+    # to surrounding body text.  Fall back to the caller's next strategy (anchor / model bbox).
+    best_box_area = (best_box[2] - best_box[0]) * (best_box[3] - best_box[1])
+    abs_best_box = (window[0] + best_box[0], window[1] + best_box[1], window[0] + best_box[2], window[1] + best_box[3])
+    if best_box_area > seed_area * 6 or _is_page_sized_box(abs_best_box, iw, ih, min_fraction=0.35):
         return None
 
     refined_min_x, refined_min_y = window_w, window_h
