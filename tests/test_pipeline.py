@@ -680,6 +680,33 @@ class TestMarkdownImageExtraction:
         assert "Sin\n\n![Figure A](page_1_10_20_30_40.png)" not in rewritten
         assert rewritten.count("ce employees report to other employees.") == 0
 
+    def test_rewrite_markdown_preserves_vlm_refs_on_pages_without_detections(self):
+        page_one_text = "Page one ![Figure A](page_1_10_20_30_40.png)\n\n"
+        page_two_text = "Page two ![Figure B](page_2_50_60_20_20.png)\n"
+        natural_text = page_one_text + page_two_text
+        page_spans = [[0, len(page_one_text), 1], [len(page_one_text), len(natural_text), 2]]
+
+        rewritten = _rewrite_markdown_with_detected_refs(
+            natural_text,
+            page_spans,
+            {
+                1: [
+                    DetectedFigureRef(
+                        page_num=1,
+                        box=(10, 20, 40, 60),
+                        filename="page_1_10_20_30_40.png",
+                        discovery_source="layout-detector",
+                    )
+                ],
+                # Page 2 intentionally omitted: detector found nothing.
+            },
+        )
+
+        # Page 1 detected ref still wins.
+        assert "![Figure A](page_1_10_20_30_40.png)" in rewritten
+        # Page 2 VLM ref must survive since we had no canonical detection there.
+        assert "![Figure B](page_2_50_60_20_20.png)" in rewritten
+
     def test_extract_page_images_uses_anchor_bbox(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")
         for x in range(5, 85):

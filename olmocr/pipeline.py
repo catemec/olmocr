@@ -777,6 +777,12 @@ def _expand_box(box: tuple[int, int, int, int], margin_x: int, margin_y: int, iw
     return _clamp_box((box[0] - margin_x, box[1] - margin_y, box[2] + margin_x, box[3] + margin_y), iw, ih)
 
 
+def _proportional_margin(box: tuple[int, int, int, int], minimum: int = 24, fraction: float = 0.08) -> tuple[int, int]:
+    box_w = max(box[2] - box[0], 0)
+    box_h = max(box[3] - box[1], 0)
+    return max(minimum, int(box_w * fraction)), max(minimum, int(box_h * fraction))
+
+
 def _is_page_sized_box(box: tuple[int, int, int, int], iw: int, ih: int, min_fraction: float = 0.85) -> bool:
     return _box_area(box) / max(iw * ih, 1) >= min_fraction
 
@@ -1025,13 +1031,23 @@ def _report_looks_scanned(report) -> bool:
         return False
 
     merged_images = _merge_image_elements(report.image_elements)
-    if len(merged_images) != 1:
+    if not merged_images:
         return False
 
     page_area = max((report.mediabox.x1 - report.mediabox.x0) * (report.mediabox.y1 - report.mediabox.y0), 1.0)
-    image_bbox = merged_images[0].bbox
-    image_area = max((image_bbox.x1 - image_bbox.x0) * (image_bbox.y1 - image_bbox.y0), 0.0)
-    return image_area / page_area >= 0.85
+    total_image_area = sum(
+        max(elem.bbox.x1 - elem.bbox.x0, 0.0) * max(elem.bbox.y1 - elem.bbox.y0, 0.0) for elem in merged_images
+    )
+    coverage = total_image_area / page_area
+
+    # Classic single-image scan.
+    if len(merged_images) == 1 and coverage >= 0.85:
+        return True
+    # Multi-tile scans (e.g. banded, two-column, or split-page scans): a small number
+    # of large image elements jointly covering most of the page.
+    if len(merged_images) <= 4 and coverage >= 0.7:
+        return True
+    return False
 
 
 def _get_cached_page_report(pdf_path: str, page_num: int, report_cache: dict[int, PageReport | None]) -> PageReport | None:
@@ -1081,7 +1097,10 @@ def _find_best_anchor_box(
         return None, report
 
     model_area = _box_area(model_box)
-    if model_area <= 0 or best_overlap / model_area <= 0.1:
+    # Require the best anchor to cover at least a quarter of the VLM-proposed box.
+    # Below this, the "best" element is likely an unrelated image that happens to
+    # clip the sloppy model bbox, and we'd rather fall through to layout/components.
+    if model_area <= 0 or best_overlap / model_area < 0.25:
         return None, report
 
     return best_box, report
@@ -1277,7 +1296,8 @@ def _enumerate_page_figure_refs(
     if detector is not None:
         try:
             for detection in detector.detect(img):
-                refined = _local_component_crop(detection.box, img, window_box=_expand_box(detection.box, 24, 24, iw, ih))
+                mx, my = _proportional_margin(detection.box)
+                refined = _local_component_crop(detection.box, img, window_box=_expand_box(detection.box, mx, my, iw, ih))
                 candidate = refined if refined is not None else detection.box
                 normalized = _normalize_box(candidate, iw, ih)
                 if normalized is None:
@@ -1571,7 +1591,8 @@ def _refine_figure_crop(
         try:
             layout_box = _pick_layout_detection(model_box, detector.detect(img))
             if layout_box is not None:
-                refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, 24, 24, iw, ih))
+                lx, ly = _proportional_margin(layout_box)
+                refined_layout_box = _local_component_crop(model_box, img, window_box=_expand_box(layout_box, lx, ly, iw, ih))
                 if refined_layout_box is not None and _intersection_area(refined_layout_box, model_box) > 0:
                     return _with_caption(refined_layout_box, "layout-detector-refined")
                 return _with_caption(_clamp_box(layout_box, iw, ih), "layout-detector")
@@ -1586,57 +1607,6 @@ def _refine_figure_crop(
         return _with_caption(anchor_box, "pdf-anchor-fallback")
 
     return _with_caption(model_box, "model-bbox")
-
-
-def _anchor_crop(
-    model_x: int, model_y: int, model_w: int, model_h: int, iw: int, ih: int, pdf_path: str, page_num: int, report_cache: dict
-) -> tuple[int, int, int, int]:
-    """Refine an approximate figure bbox using PDF image-element geometry when available."""
-    if page_num not in report_cache:
-        try:
-            report_cache[page_num] = _pdf_report(pdf_path, page_num)
-        except Exception:
-            report_cache[page_num] = None
-
-    report = report_cache[page_num]
-    if report and report.image_elements:
-        pw = report.mediabox.x1 - report.mediabox.x0
-        ph = report.mediabox.y1 - report.mediabox.y0
-        sx = iw / pw
-        sy = ih / ph
-
-        best_overlap = 0
-        best_box: tuple[int, int, int, int] | None = None
-
-        for elem in report.image_elements:
-            a_left = int((elem.bbox.x0 - report.mediabox.x0) * sx)
-            a_right = int((elem.bbox.x1 - report.mediabox.x0) * sx)
-            a_upper = int((ph - (elem.bbox.y1 - report.mediabox.y0)) * sy)
-            a_lower = int((ph - (elem.bbox.y0 - report.mediabox.y0)) * sy)
-
-            ov_w = max(0, min(model_x + model_w, a_right) - max(model_x, a_left))
-            ov_h = max(0, min(model_y + model_h, a_lower) - max(model_y, a_upper))
-            overlap = ov_w * ov_h
-
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_box = (a_left, a_upper, a_right, a_lower)
-
-        model_area = model_w * model_h
-        if best_box and model_area > 0 and best_overlap / model_area > 0.1:
-            return (
-                max(0, min(best_box[0], iw)),
-                max(0, min(best_box[1], ih)),
-                max(0, min(best_box[2], iw)),
-                max(0, min(best_box[3], ih)),
-            )
-
-    return (
-        max(0, min(model_x, iw)),
-        max(0, min(model_y, ih)),
-        max(0, min(model_x + model_w, iw)),
-        max(0, min(model_y + model_h, ih)),
-    )
 
 
 def _parse_image_ref_filename(filename: str) -> tuple[int | None, int, int, int, int]:
@@ -1774,11 +1744,13 @@ def _rewrite_markdown_with_detected_refs(
         existing_refs_by_page.setdefault(page_num, []).append((match.group(1).strip(), (x, y, x + w, y + h)))
 
     def _page_text_with_refs(page_text: str, page_num: int) -> str:
-        cleaned = _MARKDOWN_IMAGE_TAG_RE.sub("", page_text).rstrip("\n")
         page_refs = detected_refs_by_page.get(page_num, [])
         if not page_refs:
-            return cleaned
+            # Preserve any VLM-emitted refs on pages where detection found nothing,
+            # rather than silently dropping them.
+            return page_text.rstrip("\n")
 
+        cleaned = _MARKDOWN_IMAGE_TAG_RE.sub("", page_text).rstrip("\n")
         unmatched_existing = list(existing_refs_by_page.get(page_num, []))
         rendered_refs: list[str] = []
         for detected_ref in page_refs:
