@@ -1082,11 +1082,27 @@ def _refine_component_box_to_original_foreground(component_box: tuple[int, int, 
         return None
     rows = np.where(sub.any(axis=1))[0]
     cols = np.where(sub.any(axis=0))[0]
-    return (
+    refined = (
         x0 + int(cols[0]),
         y0 + int(rows[0]),
         x0 + int(cols[-1]) + 1,
         y0 + int(rows[-1]) + 1,
+    )
+
+    # Preserve some of the dilation halo so sparse scanned charts and thin-line
+    # diagrams are not shaved down to exact ink bounds.
+    left_trim = max(0, refined[0] - x0)
+    top_trim = max(0, refined[1] - y0)
+    right_trim = max(0, x1 - refined[2])
+    bottom_trim = max(0, y1 - refined[3])
+    relaxed_margin_x = min(6, max(2, int(max(left_trim, right_trim) * 0.5)))
+    relaxed_margin_y = min(4, max(1, int(max(top_trim, bottom_trim) * 0.5)))
+
+    return (
+        max(x0, refined[0] - min(relaxed_margin_x, left_trim)),
+        max(y0, refined[1] - min(relaxed_margin_y, top_trim)),
+        min(x1, refined[2] + min(relaxed_margin_x, right_trim)),
+        min(y1, refined[3] + min(relaxed_margin_y, bottom_trim)),
     )
 
 

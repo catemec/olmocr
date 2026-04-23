@@ -16,6 +16,7 @@ from olmocr.pipeline import (
     LayoutDetection,
     PageResult,
     _count_true_runs_np,
+    _refine_component_box_to_original_foreground,
     _prefix_markdown_image_refs,
     _resolve_doclayout_yolo_model_path,
     _strip_junk_figure_refs,
@@ -1233,8 +1234,12 @@ class TestMarkdownImageExtraction:
                     detected = detect_page_figure_refs(natural_text, "dummy.pdf", page_spans=[[0, len(natural_text), 1]], layout_model_name="mock-layout")
 
         assert 1 in detected
-        assert [ref.filename for ref in detected[1]] == ["page_1_32_42_56_50.png"]
+        assert len(detected[1]) == 1
         assert detected[1][0].discovery_source == "layout-detector-refined"
+        assert detected[1][0].box[0] <= 32
+        assert detected[1][0].box[1] <= 42
+        assert detected[1][0].box[2] >= 88
+        assert detected[1][0].box[3] >= 92
 
     def test_detect_page_figure_refs_filters_text_line_fragments(self):
         img = Image.new("RGB", (160, 160), color="white")
@@ -1262,6 +1267,20 @@ class TestMarkdownImageExtraction:
                     detected = detect_page_figure_refs("plain page text", "dummy.pdf", page_spans=[[0, 15, 1]], layout_model_name="mock-layout")
 
         assert detected == {}
+
+    def test_refine_component_box_to_original_foreground_keeps_some_dilation_margin(self):
+        foreground = np.zeros((24, 48), dtype=bool)
+        foreground[5:20, 7:8] = True
+        foreground[7:18, 20:21] = True
+        foreground[3:22, 37:38] = True
+
+        refined = _refine_component_box_to_original_foreground((4, 2, 41, 23), foreground)
+
+        assert refined is not None
+        assert refined[0] < 7
+        assert refined[1] < 3
+        assert refined[2] > 38
+        assert refined[3] > 20
 
     def test_detect_page_figure_refs_falls_back_to_page_components_when_detector_missing(self):
         img = Image.new("RGB", (220, 260), color="white")
