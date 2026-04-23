@@ -20,11 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cache
 from io import BytesIO
+from typing import cast
 from urllib.parse import urlparse
 
 import boto3
 import httpx
 import numpy as np
+from numpy.typing import NDArray
 from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
 from PIL import Image
@@ -1143,8 +1145,9 @@ def _extend_box_to_caption(box: tuple[int, int, int, int], img: "Image.Image") -
     if region.size == 0:
         return clamped_box
 
+    region_height, region_width = region.shape
     foreground: NDArray[np.bool_] = region < 235
-    row_has_ink: NDArray[np.bool_] = np.any(foreground, axis=1)
+    row_has_ink = cast(NDArray[np.bool_], np.any(foreground, axis=1))
     first_ink: NDArray[np.intp] = np.argmax(foreground, axis=1)
     last_ink: NDArray[np.intp] = region_width - 1 - np.argmax(foreground[:, ::-1], axis=1)
     no_ink: NDArray[np.bool_] = ~row_has_ink
@@ -1397,7 +1400,7 @@ def _local_component_crop(
     original_foreground = gray < 235
     dilated = binary_dilation(original_foreground, structure=_DILATE_5X5)
 
-    labels, num_labels = scipy_label(dilated, structure=_CONNECTIVITY_4)
+    labels, num_labels = cast(tuple[np.ndarray, int], scipy_label(dilated, structure=_CONNECTIVITY_4))
     if num_labels == 0:
         return None
 
