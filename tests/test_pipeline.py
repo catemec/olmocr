@@ -13,7 +13,9 @@ from olmocr.pipeline import (
     DetectedFigureRef,
     LayoutDetection,
     PageResult,
+    _is_junk_figure_crop,
     _prefix_markdown_image_refs,
+    _strip_junk_figure_refs,
     _load_layout_detector_model,
     _augment_markdown_with_detected_refs,
     _qualify_markdown_image_refs,
@@ -1343,6 +1345,84 @@ class TestMarkdownImageExtraction:
         )
 
         assert "![An Instance of Works\\_In3](page_1_2_2_12_10.png)" in rewritten
+
+
+class TestJunkFigureFiltering:
+    def _make_body_text_image(self, width: int = 400, height: int = 600) -> "Image.Image":
+        """Synthetic body-text page: horizontal text lines spanning most of the width."""
+        img = Image.new("RGB", (width, height), "white")
+        # 7px of ink every 18px, spanning the text column (every 2nd column ≈ 50 % character density)
+        line_spacing = 18
+        ink_per_line = 7
+        n_lines = (height - 80) // line_spacing
+        for i in range(n_lines):
+            y0 = 40 + i * line_spacing
+            y1 = min(y0 + ink_per_line, height)
+            for y in range(y0, y1):
+                for x in range(30, width - 30, 2):
+                    img.putpixel((x, y), (0, 0, 0))
+        return img
+
+    def _make_diagram_image(self, width: int = 400, height: int = 300) -> "Image.Image":
+        """Synthetic diagram: a few rectangular boxes with whitespace between them."""
+        img = Image.new("RGB", (width, height), "white")
+        boxes = [(40, 40, 160, 120), (220, 40, 360, 120), (140, 180, 260, 260)]
+        for bx0, by0, bx1, by1 in boxes:
+            for x in range(bx0, bx1):
+                img.putpixel((x, by0), (0, 0, 0))
+                img.putpixel((x, by1), (0, 0, 0))
+            for y in range(by0, by1):
+                img.putpixel((bx0, y), (0, 0, 0))
+                img.putpixel((bx1, y), (0, 0, 0))
+        return img
+
+    def test_is_junk_figure_crop_detects_body_text_page(self):
+        junk = self._make_body_text_image()
+        assert _is_junk_figure_crop(junk), "Dense body text should be classified as junk"
+
+    def test_is_junk_figure_crop_passes_diagram(self):
+        diagram = self._make_diagram_image()
+        assert not _is_junk_figure_crop(diagram), "Diagram with boxes should not be classified as junk"
+
+    def test_is_junk_figure_crop_passes_tiny_image(self):
+        tiny = Image.new("RGB", (40, 40), "white")
+        assert not _is_junk_figure_crop(tiny), "Image smaller than minimum size should never be classified as junk"
+
+    def test_strip_junk_figure_refs_removes_tagged_refs(self):
+        markdown = "Some text.\n\n![Figure 1](assets/page_1_0_0_100_200.png)\n\nMore text."
+        cleaned = _strip_junk_figure_refs(markdown, {"page_1_0_0_100_200.png"})
+        assert "page_1_0_0_100_200.png" not in cleaned
+        assert "Some text." in cleaned
+        assert "More text." in cleaned
+
+    def test_strip_junk_figure_refs_leaves_non_junk_intact(self):
+        markdown = "![Figure 1](assets/page_1_0_0_100_200.png)\n\n![Figure 2](assets/page_2_0_0_80_60.png)"
+        cleaned = _strip_junk_figure_refs(markdown, {"page_1_0_0_100_200.png"})
+        assert "page_1_0_0_100_200.png" not in cleaned
+        assert "page_2_0_0_80_60.png" in cleaned
+
+    def test_extract_page_images_skips_junk_and_returns_filename(self, tmp_path):
+        """extract_page_images must return the junk filename and not write its PNG."""
+        junk_img = self._make_body_text_image(400, 600)
+        buffer = BytesIO()
+        junk_img.save(buffer, format="PNG")
+        image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        scanned_report = PageReport(
+            mediabox=BoundingBox(0, 0, 400, 600),
+            text_elements=[],
+            image_elements=[ImageElement("Scan", BoundingBox(0, 0, 400, 600))],
+        )
+
+        natural_text = "![Figure](page_1_0_0_400_600.png)"
+
+        with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
+            with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
+                with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
+                    junk = extract_page_images(natural_text, str(tmp_path), "dummy.pdf")
+
+        assert "page_1_0_0_400_600.png" in junk, "Junk filename must be returned"
+        assert not (tmp_path / "page_1_0_0_400_600.png").exists(), "Junk PNG must not be written to disk"
 
 
 class TestPromptContract:

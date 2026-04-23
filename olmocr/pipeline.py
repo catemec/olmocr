@@ -827,6 +827,37 @@ _CONNECTIVITY_4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 _DILATE_5X5 = np.ones((5, 5), dtype=bool)
 
 
+def _is_junk_figure_crop(crop: "Image.Image") -> bool:
+    """Return True if the crop looks like a body-text page rather than a figure or diagram.
+
+    Body-text crops have many horizontally-dense rows of ink (text lines) spanning
+    most of the crop width.  Legitimate figures (diagrams, charts, photos) are either
+    sparse or have ink concentrated in specific regions, so their dense-row fraction
+    is much lower.
+    """
+    w, h = crop.size
+    if w < 60 or h < 60:
+        return False
+    gray = np.asarray(crop.convert("L"))
+    foreground = gray < 235
+
+    row_ink = foreground.sum(axis=1)  # ink pixels per row
+    col_ink = foreground.sum(axis=0)  # ink pixels per column
+
+    # A row is "text-dense" if >= 12 % of its width is foreground (typical for a text line).
+    dense_rows = int((row_ink >= max(2, int(w * 0.12))).sum())
+    # A column is "active" if it has ink in >= 8 % of its height.
+    dense_cols = int((col_ink >= max(2, int(h * 0.08))).sum())
+
+    dense_row_fraction = dense_rows / h
+    dense_col_fraction = dense_cols / w
+    fill_ratio = int(foreground.sum()) / max(w * h, 1)
+
+    # Body text: many dense lines (>= 28 % of height) spanning most of the width
+    # (>= 35 % of columns active), with a moderate overall fill (2-25 %).
+    return dense_row_fraction >= 0.28 and dense_col_fraction >= 0.35 and 0.02 <= fill_ratio <= 0.25
+
+
 def _count_true_runs_np(mask: np.ndarray) -> int:
     if mask.size == 0:
         return 0
@@ -1756,6 +1787,15 @@ def _augment_markdown_with_detected_refs(
     return _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
 
 
+def _strip_junk_figure_refs(text: str, junk_filenames: set[str]) -> str:
+    """Remove every ![alt](path/to/junk.png) image tag whose bare filename is in junk_filenames."""
+    for filename in junk_filenames:
+        # Match the tag regardless of any path prefix that _prefix_markdown_image_refs may have added.
+        pattern = re.compile(r"!\[[^\]]*\]\([^)]*" + re.escape(filename) + r"\)\n?")
+        text = pattern.sub("", text)
+    return text
+
+
 def _prefix_markdown_image_refs(natural_text: str, asset_prefix: str) -> str:
     if not asset_prefix:
         return natural_text
@@ -1794,7 +1834,7 @@ def extract_page_images(
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
     detected_refs_by_page: dict[int, list[str]] | None = None,
-) -> None:
+) -> set[str]:
     """Crop and save figure images referenced in olmocr markdown output.
 
     The model emits references like ![caption](page_x_y_w_h.png) where
@@ -1805,6 +1845,7 @@ def extract_page_images(
     """
     page_cache: dict[int, Image.Image] = {}
     report_cache: dict[int, PageReport | None] = {}
+    junk_filenames: set[str] = set()
 
     filenames: list[str] = []
     seen_filenames: set[str] = set()
@@ -1837,7 +1878,7 @@ def extract_page_images(
     auto_detected_filenames = {ref for refs in detected_refs_by_page.values() for ref in refs}
 
     if not filenames:
-        return
+        return set()
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1870,9 +1911,17 @@ def extract_page_images(
         )
 
         if right > left and lower > upper:
-            img.crop((left, upper, right, lower)).save(dest, format="PNG")
-            ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
-            logger.info(f"Extracted figure {filename} from {pdf_path} page {page_num} via {crop_source} ({ref_origin})")
+            crop_img = img.crop((left, upper, right, lower))
+            if _is_junk_figure_crop(crop_img):
+                ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
+                logger.info(f"Skipped junk figure {filename} from {pdf_path} page {page_num} ({ref_origin})")
+                junk_filenames.add(filename)
+            else:
+                crop_img.save(dest, format="PNG")
+                ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
+                logger.info(f"Extracted figure {filename} from {pdf_path} page {page_num} via {crop_source} ({ref_origin})")
+
+    return junk_filenames
 
 
 def get_markdown_path(workspace: str, source_file: str) -> str:
@@ -2054,7 +2103,7 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                             and "::" not in source_file
                         ):
                             try:
-                                extract_page_images(
+                                junk_filenames = extract_page_images(
                                     natural_text,
                                     markdown_asset_dir,
                                     source_file,
@@ -2064,6 +2113,12 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                                     layout_model_score_threshold=args.figure_layout_score_threshold,
                                     detected_refs_by_page=detected_refs_by_page,
                                 )
+                                if junk_filenames:
+                                    cleaned_markdown = _strip_junk_figure_refs(rendered_markdown_text, junk_filenames)
+                                    if cleaned_markdown != rendered_markdown_text:
+                                        with open(markdown_path, "w") as md_f:
+                                            md_f.write(cleaned_markdown)
+                                        logger.info(f"Removed {len(junk_filenames)} junk figure ref(s) from {markdown_path}")
                             except Exception as img_err:
                                 logger.warning(f"Image extraction failed for {source_file}: {img_err}")
 
