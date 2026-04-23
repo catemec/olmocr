@@ -827,58 +827,63 @@ _CONNECTIVITY_4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 _DILATE_5X5 = np.ones((5, 5), dtype=bool)
 
 
-def _is_junk_figure_crop(crop: "Image.Image") -> bool:
-    """Return True if the crop looks like a body-text page rather than a figure or diagram.
+def _vlm_verify_is_figure(
+    crop: "Image.Image",
+    server: str | None,
+    model: str,
+    api_key: str | None = None,
+    timeout: float = 30.0,
+) -> bool:
+    """Ask the VLM whether a cropped region is a real figure vs. plain body text.
 
-    Body-text crops have many horizontally-dense rows of ink (text lines) spanning
-    most of the crop width.  Legitimate figures (diagrams, charts, photos) are either
-    sparse or have ink concentrated in specific regions, so their dense-row fraction
-    is much lower.  Critically, body text has many *separate* text-line runs (15+),
-    whereas a labeled diagram (e.g. a 3-tier abstraction diagram) has only a handful.
+    Returns True if the crop should be kept as a figure. On any failure (no server
+    configured, network error, parse error) returns True (fail-open) so that
+    verification can never silently drop legitimate figures.
     """
-    w, h = crop.size
-    if w < 60 or h < 60:
-        return False
-    gray = np.asarray(crop.convert("L"))
-    foreground = gray < 235
+    if not server:
+        return True
 
-    row_ink = foreground.sum(axis=1)  # ink pixels per row
-    col_ink = foreground.sum(axis=0)  # ink pixels per column
+    buffer = BytesIO()
+    crop.save(buffer, format="PNG")
+    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    # A row is "text-dense" if >= 12 % of its width is foreground (typical for a text line).
-    dense_rows_mask = row_ink >= max(2, int(w * 0.12))
-    # A column is "active" if it has ink in >= 8 % of its height.
-    active_cols_mask = col_ink >= max(2, int(h * 0.08))
-    dense_cols = int(active_cols_mask.sum())
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Is this image a figure, diagram, chart, illustration, or photograph "
+                            "(answer yes), or is it a block of plain body text / ordinary page "
+                            "content with no distinct visual figure (answer no)? "
+                            "Respond with a single word: yes or no."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 8,
+        "temperature": 0.0,
+    }
 
-    dense_row_fraction = int(dense_rows_mask.sum()) / h
-    dense_col_fraction = dense_cols / w
-    fill_ratio = int(foreground.sum()) / max(w * h, 1)
-    # Number of separate runs of dense rows — body text has one per text line (15+);
-    # a labeled diagram has only a few (3–8 for the text inside each box/section).
-    dense_row_runs = _count_true_runs_np(dense_rows_mask)
-    # Number of separate runs of active columns — body text is one contiguous column
-    # block (1, or 2 for two-column layouts); a labeled diagram has horizontal gaps
-    # between boxes, yielding 3+ separate column runs.
-    active_col_runs = _count_true_runs_np(active_cols_mask)
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = f"{server.rstrip('/')}/chat/completions"
 
-    # Body text: many dense lines (>= 35 % of height), spanning most of the width
-    # (>= 35 % of columns active), with >= 15 distinct text-line runs and moderate fill,
-    # arranged in at most 2 contiguous column groups.
-    return (
-        dense_row_fraction >= 0.35
-        and dense_col_fraction >= 0.35
-        and dense_row_runs >= 15
-        and 0.02 <= fill_ratio <= 0.25
-        and active_col_runs <= 2
-    )
+    try:
+        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip().lower()
+    except Exception as e:
+        logger.warning(f"Figure verification VLM call failed, keeping figure: {e}")
+        return True
 
-
-def _count_true_runs_np(mask: np.ndarray) -> int:
-    if mask.size == 0:
-        return 0
-    prev = np.concatenate(([False], mask[:-1]))
-    return int(np.logical_and(mask, ~prev).sum())
+    return not content.startswith("n")
 
 
 def _is_probable_text_fragment(box: tuple[int, int, int, int], img: Image.Image) -> bool:
@@ -1850,6 +1855,9 @@ def extract_page_images(
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
     detected_refs_by_page: dict[int, list[str]] | None = None,
+    vlm_verify_server: str | None = None,
+    vlm_verify_model: str = "olmocr",
+    vlm_verify_api_key: str | None = None,
 ) -> set[str]:
     """Crop and save figure images referenced in olmocr markdown output.
 
@@ -1928,13 +1936,12 @@ def extract_page_images(
 
         if right > left and lower > upper:
             crop_img = img.crop((left, upper, right, lower))
-            if _is_junk_figure_crop(crop_img):
-                ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
-                logger.info(f"Skipped junk figure {filename} from {pdf_path} page {page_num} ({ref_origin})")
+            ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
+            if not _vlm_verify_is_figure(crop_img, vlm_verify_server, vlm_verify_model, vlm_verify_api_key):
+                logger.info(f"Skipped non-figure crop {filename} from {pdf_path} page {page_num} ({ref_origin}) per VLM verification")
                 junk_filenames.add(filename)
             else:
                 crop_img.save(dest, format="PNG")
-                ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
                 logger.info(f"Extracted figure {filename} from {pdf_path} page {page_num} via {crop_source} ({ref_origin})")
 
     return junk_filenames
@@ -2128,6 +2135,9 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                                     layout_model_device=args.figure_layout_device,
                                     layout_model_score_threshold=args.figure_layout_score_threshold,
                                     detected_refs_by_page=detected_refs_by_page,
+                                    vlm_verify_server=args.server,
+                                    vlm_verify_model=args.model,
+                                    vlm_verify_api_key=getattr(args, "api_key", None),
                                 )
                                 if junk_filenames:
                                     cleaned_markdown = _strip_junk_figure_refs(rendered_markdown_text, junk_filenames)
