@@ -17,6 +17,7 @@ from olmocr.pipeline import (
     PageResult,
     _count_true_runs_np,
     _prefix_markdown_image_refs,
+    _resolve_doclayout_yolo_model_path,
     _strip_junk_figure_refs,
     _vlm_verify_is_figure,
     _load_layout_detector_model,
@@ -132,6 +133,17 @@ class TestFigureLayoutDetectorLoading:
         detector = get_figure_layout_detector("dummy-layout-model", "cpu", 0.35, "unsupported-backend")
         assert detector is None
 
+    def test_resolve_doclayout_yolo_model_path_prefers_pt_file_from_hf_repo(self):
+        with patch("olmocr.pipeline.list_repo_files", return_value=["README.md", "weights/doclayout_yolo_docstructbench_imgsz1024.pt", "other.bin"]):
+            with patch("olmocr.pipeline.hf_hub_download", return_value="/tmp/doclayout_yolo_docstructbench_imgsz1024.pt") as mock_download:
+                resolved = _resolve_doclayout_yolo_model_path("juliozhao/DocLayout-YOLO-DocStructBench")
+
+        assert resolved == "/tmp/doclayout_yolo_docstructbench_imgsz1024.pt"
+        mock_download.assert_called_once_with(
+            repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
+            filename="weights/doclayout_yolo_docstructbench_imgsz1024.pt",
+        )
+
     def test_doclayout_yolo_detector_filters_non_figure_labels(self):
         class FakeTensor:
             def __init__(self, values):
@@ -156,15 +168,15 @@ class TestFigureLayoutDetectorLoading:
             names = {0: "figure", 1: "text"}
 
         class FakeYOLO:
-            @staticmethod
-            def from_pretrained(model_name):
-                return FakeYOLO()
+            def __init__(self, model_path):
+                self.model_path = model_path
 
             def predict(self, image, conf, device, verbose=False):
                 return [FakeResult()]
 
         with patch.dict("sys.modules", {"doclayout_yolo": type("M", (), {"YOLOv10": FakeYOLO})()}):
-            detector = DocLayoutYoloFigureLayoutDetector("dummy-layout-model", "cpu", 0.35)
+            with patch("olmocr.pipeline._resolve_doclayout_yolo_model_path", return_value="/tmp/model.pt"):
+                detector = DocLayoutYoloFigureLayoutDetector("dummy-layout-model", "cpu", 0.35)
 
         detections = detector.detect(Image.new("RGB", (100, 120), color="white"))
         assert detections == [LayoutDetection(label="figure", score=0.92, box=(10, 20, 80, 121))]

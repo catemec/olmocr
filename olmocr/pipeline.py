@@ -28,7 +28,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 from botocore.exceptions import ClientError
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
 from PIL import Image
 from pypdf import PdfReader
 from scipy.ndimage import binary_dilation, find_objects, label as scipy_label
@@ -708,6 +708,37 @@ def _normalize_layout_backend(backend: str | None) -> str:
     return normalized
 
 
+@cache
+def _resolve_doclayout_yolo_model_path(model_name: str) -> str:
+    if os.path.isfile(model_name):
+        return model_name
+
+    if os.path.isdir(model_name):
+        pt_files = sorted(file_name for file_name in os.listdir(model_name) if file_name.endswith(".pt"))
+        if not pt_files:
+            raise FileNotFoundError(f"No .pt weights found in local DocLayout-YOLO model directory: {model_name}")
+        return os.path.join(model_name, pt_files[0])
+
+    if "/" not in model_name:
+        return model_name
+
+    repo_files = list_repo_files(model_name)
+    pt_candidates = [file_name for file_name in repo_files if file_name.endswith(".pt")]
+    if not pt_candidates:
+        raise FileNotFoundError(f"No .pt weights found in Hugging Face repo: {model_name}")
+
+    def _candidate_score(file_name: str) -> tuple[int, int, str]:
+        basename = os.path.basename(file_name).lower()
+        return (
+            0 if "/" not in file_name else 1,
+            0 if "doclayout" in basename else 1,
+            basename,
+        )
+
+    selected_file = min(pt_candidates, key=_candidate_score)
+    return hf_hub_download(repo_id=model_name, filename=selected_file)
+
+
 class FigureLayoutDetector:
     FIGURE_LABEL_TOKENS = ("picture", "figure", "chart", "diagram", "graphic", "image")
 
@@ -757,11 +788,8 @@ class DocLayoutYoloFigureLayoutDetector:
         resolved_device = _resolve_layout_device(device, torch)
         self.device = resolved_device
         self.score_threshold = score_threshold
-
-        if hasattr(YOLOv10, "from_pretrained"):
-            self.model = YOLOv10.from_pretrained(model_name)
-        else:
-            self.model = YOLOv10(model_name)
+        model_path = _resolve_doclayout_yolo_model_path(model_name)
+        self.model = YOLOv10(model_path)
 
     def detect(self, image: "Image.Image") -> list[LayoutDetection]:
         results = self.model.predict(np.asarray(image), conf=self.score_threshold, device=self.device, verbose=False)
