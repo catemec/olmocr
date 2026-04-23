@@ -848,7 +848,8 @@ def _is_junk_figure_crop(crop: "Image.Image") -> bool:
     # A row is "text-dense" if >= 12 % of its width is foreground (typical for a text line).
     dense_rows_mask = row_ink >= max(2, int(w * 0.12))
     # A column is "active" if it has ink in >= 8 % of its height.
-    dense_cols = int((col_ink >= max(2, int(h * 0.08))).sum())
+    active_cols_mask = col_ink >= max(2, int(h * 0.08))
+    dense_cols = int(active_cols_mask.sum())
 
     dense_row_fraction = int(dense_rows_mask.sum()) / h
     dense_col_fraction = dense_cols / w
@@ -856,10 +857,21 @@ def _is_junk_figure_crop(crop: "Image.Image") -> bool:
     # Number of separate runs of dense rows — body text has one per text line (15+);
     # a labeled diagram has only a few (3–8 for the text inside each box/section).
     dense_row_runs = _count_true_runs_np(dense_rows_mask)
+    # Number of separate runs of active columns — body text is one contiguous column
+    # block (1, or 2 for two-column layouts); a labeled diagram has horizontal gaps
+    # between boxes, yielding 3+ separate column runs.
+    active_col_runs = _count_true_runs_np(active_cols_mask)
 
     # Body text: many dense lines (>= 35 % of height), spanning most of the width
-    # (>= 35 % of columns active), with >= 15 distinct text-line runs and moderate fill.
-    return dense_row_fraction >= 0.35 and dense_col_fraction >= 0.35 and dense_row_runs >= 15 and 0.02 <= fill_ratio <= 0.25
+    # (>= 35 % of columns active), with >= 15 distinct text-line runs and moderate fill,
+    # arranged in at most 2 contiguous column groups.
+    return (
+        dense_row_fraction >= 0.35
+        and dense_col_fraction >= 0.35
+        and dense_row_runs >= 15
+        and 0.02 <= fill_ratio <= 0.25
+        and active_col_runs <= 2
+    )
 
 
 def _count_true_runs_np(mask: np.ndarray) -> int:
