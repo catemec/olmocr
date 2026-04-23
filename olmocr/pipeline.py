@@ -38,7 +38,7 @@ from olmocr.check import (
     check_poppler_version,
     check_torch_gpu_available,
 )
-from olmocr.data.renderpdf import get_png_dimensions_from_base64, render_pdf_to_base64png
+from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.filter.filter import Language, PdfFilter
 from olmocr.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
 from olmocr.metrics import MetricsKeeper, WorkerTracker
@@ -141,7 +141,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": build_no_anchoring_v4_yaml_prompt(*get_png_dimensions_from_base64(image_base64))},
+                    {"type": "text", "text": build_no_anchoring_v4_yaml_prompt()},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
                 ],
             }

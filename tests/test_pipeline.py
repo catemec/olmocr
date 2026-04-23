@@ -29,7 +29,6 @@ from olmocr.pipeline import (
     get_markdown_path,
     process_page,
 )
-from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
 from olmocr.prompts.anchor import BoundingBox, ImageElement, PageReport
 
 
@@ -1447,17 +1446,6 @@ class TestJunkFigureFiltering:
 
 
 class TestPromptContract:
-    def test_build_no_anchoring_v4_yaml_prompt_requests_approximate_figure_seed_box(self):
-        prompt = build_no_anchoring_v4_yaml_prompt(1000, 1200)
-
-        assert "approximate bounding box for the figure or image itself" in prompt
-        assert "does not need to be pixel-perfect" in prompt
-        assert "Include text that is part of the figure or image itself" in prompt
-        assert "figure caption immediately attached below it" in prompt
-        assert "include the figure caption when it belongs to that figure" in prompt
-        assert "exclude nearby body text that is outside the figure-caption block" in prompt
-        assert "prefer the figure together with its caption rather than the entire scanned page image" in prompt
-
     def test_extract_page_images_falls_back_locally_when_scanned_detector_unavailable(self, tmp_path):
         img = Image.new("RGB", (100, 100), color="white")
         for x in range(18, 52):
