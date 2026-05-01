@@ -20,7 +20,7 @@ from olmocr.pipeline import (
     _prefix_markdown_image_refs,
     _resolve_doclayout_yolo_model_path,
     _strip_junk_figure_refs,
-    _vlm_verify_is_figure,
+    _heuristic_is_figure,
     _load_layout_detector_model,
     _normalize_layout_backend,
     _augment_markdown_with_detected_refs,
@@ -1549,8 +1549,8 @@ class TestJunkFigureFiltering:
         assert "page_1_0_0_100_200.png" not in cleaned
         assert "page_2_0_0_80_60.png" in cleaned
 
-    def test_extract_page_images_skips_junk_when_vlm_says_no(self, tmp_path):
-        """When the VLM verifier returns False, the crop is treated as junk."""
+    def test_extract_page_images_skips_junk_when_heuristic_says_no(self, tmp_path):
+        """When the heuristic verifier rejects a crop, it is treated as junk."""
         img = Image.new("RGB", (400, 600), "white")
         buffer = BytesIO()
         img.save(buffer, format="PNG")
@@ -1567,19 +1567,14 @@ class TestJunkFigureFiltering:
         with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
             with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
                 with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
-                    with patch("olmocr.pipeline._vlm_verify_is_figure", return_value=False):
-                        junk = extract_page_images(
-                            natural_text,
-                            str(tmp_path),
-                            "dummy.pdf",
-                            vlm_verify_server="http://fake",
-                        )
+                    with patch("olmocr.pipeline._heuristic_is_figure", return_value=False):
+                        junk = extract_page_images(natural_text, str(tmp_path), "dummy.pdf")
 
         assert "page_1_0_0_400_600.png" in junk, "Junk filename must be returned"
         assert not (tmp_path / "page_1_0_0_400_600.png").exists(), "Junk PNG must not be written to disk"
 
-    def test_extract_page_images_keeps_crop_when_vlm_says_yes(self, tmp_path):
-        """When the VLM verifier returns True, the crop is written to disk and not junk."""
+    def test_extract_page_images_keeps_crop_when_heuristic_says_yes(self, tmp_path):
+        """When the heuristic verifier accepts a crop, it is written to disk and not junk."""
         img = Image.new("RGB", (400, 600), "white")
         buffer = BytesIO()
         img.save(buffer, format="PNG")
@@ -1596,41 +1591,48 @@ class TestJunkFigureFiltering:
         with patch("olmocr.pipeline.render_pdf_to_base64png", return_value=image_base64):
             with patch("olmocr.pipeline._pdf_report", return_value=scanned_report):
                 with patch("olmocr.pipeline.get_figure_layout_detector", return_value=None):
-                    with patch("olmocr.pipeline._vlm_verify_is_figure", return_value=True):
-                        junk = extract_page_images(
-                            natural_text,
-                            str(tmp_path),
-                            "dummy.pdf",
-                            vlm_verify_server="http://fake",
-                        )
+                    with patch("olmocr.pipeline._heuristic_is_figure", return_value=True):
+                        junk = extract_page_images(natural_text, str(tmp_path), "dummy.pdf")
 
         assert junk == set(), "No filenames should be reported as junk"
         assert (tmp_path / "page_1_0_0_400_600.png").exists(), "PNG must be written to disk"
 
-    def test_vlm_verify_is_figure_no_server_returns_true(self):
-        """With no server configured, the verifier must fail-open (keep the figure)."""
-        img = Image.new("RGB", (100, 100), "white")
-        assert _vlm_verify_is_figure(img, server=None, model="olmocr") is True
+    def test_heuristic_is_figure_blank_crop_is_kept(self):
+        """A blank crop carries no text-like signal, so it must be kept (fail-open)."""
+        img = Image.new("RGB", (200, 200), "white")
+        assert _heuristic_is_figure(img) is True
 
-    def test_vlm_verify_is_figure_parses_no_response(self):
-        """A response starting with 'no' must be treated as not-a-figure."""
-        img = Image.new("RGB", (100, 100), "white")
-        fake_resp = type(
-            "R",
-            (),
-            {
-                "raise_for_status": lambda self: None,
-                "json": lambda self: {"choices": [{"message": {"content": "No, this is body text."}}]},
-            },
-        )()
-        with patch("olmocr.pipeline.httpx.post", return_value=fake_resp):
-            assert _vlm_verify_is_figure(img, server="http://fake", model="olmocr") is False
+    def test_heuristic_is_figure_tiny_crop_is_kept(self):
+        """Crops too small to assess reliably are kept."""
+        img = Image.new("RGB", (20, 20), "white")
+        assert _heuristic_is_figure(img) is True
 
-    def test_vlm_verify_is_figure_network_error_keeps_figure(self):
-        """A network error must fail-open and keep the figure."""
-        img = Image.new("RGB", (100, 100), "white")
-        with patch("olmocr.pipeline.httpx.post", side_effect=Exception("boom")):
-            assert _vlm_verify_is_figure(img, server="http://fake", model="olmocr") is True
+    def test_heuristic_is_figure_colored_crop_is_kept(self):
+        """A crop with significant color content is kept as a figure."""
+        img = Image.new("RGB", (200, 200), "white")
+        for x in range(40, 160):
+            for y in range(40, 160):
+                img.putpixel((x, y), (200, 50, 50))
+        assert _heuristic_is_figure(img) is True
+
+    def test_heuristic_is_figure_text_block_is_dropped(self):
+        """A multi-line monochrome text block exhibits the line/gap pattern and is dropped."""
+        img = Image.new("RGB", (300, 240), "white")
+        # 8 lines of "text": 12px tall, 18px gap. 8 * 30 = 240.
+        for line in range(8):
+            top = line * 30 + 6
+            for y in range(top, top + 12):
+                for x in range(20, 280):
+                    img.putpixel((x, y), (0, 0, 0))
+        assert _heuristic_is_figure(img) is False
+
+    def test_heuristic_is_figure_solid_diagram_is_kept(self):
+        """A grayscale crop with one large dark region (diagram) is not a text block."""
+        img = Image.new("RGB", (300, 240), "white")
+        for x in range(60, 240):
+            for y in range(40, 200):
+                img.putpixel((x, y), (40, 40, 40))
+        assert _heuristic_is_figure(img) is True
 
 
 class TestPromptContract:

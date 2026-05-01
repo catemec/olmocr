@@ -925,63 +925,53 @@ _CONNECTIVITY_4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
 _DILATE_5X5 = np.ones((5, 5), dtype=bool)
 
 
-def _vlm_verify_is_figure(
-    crop: "Image.Image",
-    server: str | None,
-    model: str,
-    api_key: str | None = None,
-    timeout: float = 30.0,
-) -> bool:
-    """Ask the VLM whether a cropped region is a real figure vs. plain body text.
+def _heuristic_is_figure(crop: "Image.Image") -> bool:
+    """Cheap CPU-side check: does this crop look like a figure vs. a block of body text?
 
-    Returns True if the crop should be kept as a figure. On any failure (no server
-    configured, network error, parse error) returns True (fail-open) so that
-    verification can never silently drop legitimate figures.
+    Returns True for figure-like content (charts, photos, diagrams, illustrations) so it
+    is kept, and False for crops that look like a passage of body text so they are dropped
+    as junk. Biased toward keeping the crop: only returns False when text-like signals
+    are unambiguous, mirroring the prior VLM verifier's fail-open behavior.
     """
-    if not server:
+    width, height = crop.size
+    if width < 40 or height < 40:
         return True
 
-    buffer = BytesIO()
-    crop.save(buffer, format="PNG")
-    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Is this image a figure, diagram, chart, illustration, or photograph "
-                            "(answer yes), or is it a block of plain body text / ordinary page "
-                            "content with no distinct visual figure (answer no)? "
-                            "Respond with a single word: yes or no."
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                ],
-            }
-        ],
-        "max_tokens": 8,
-        "temperature": 0.0,
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    url = f"{server.rstrip('/')}/chat/completions"
-
-    try:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip().lower()
-    except Exception as e:
-        logger.warning(f"Figure verification VLM call failed, keeping figure: {e}")
+    rgb = np.asarray(crop.convert("RGB"))
+    r = rgb[..., 0].astype(np.int16)
+    g = rgb[..., 1].astype(np.int16)
+    b = rgb[..., 2].astype(np.int16)
+    chroma = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(r - b))
+    if float((chroma > 25).mean()) > 0.04:
         return True
 
-    return not content.startswith("n")
+    gray = np.asarray(crop.convert("L"))
+    ink = gray <= 200
+    row_ink = ink.sum(axis=1)
+    row_active = row_ink >= max(2, int(width * 0.05))
+
+    # Lengths of each contiguous active-row group (text-line candidates).
+    diff = np.diff(row_active.astype(np.int8))
+    starts = np.where(diff == 1)[0] + 1
+    ends = np.where(diff == -1)[0] + 1
+    if row_active[0]:
+        starts = np.r_[0, starts]
+    if row_active[-1]:
+        ends = np.r_[ends, len(row_active)]
+    run_lengths = ends - starts
+
+    if len(run_lengths) < 4:
+        return True
+
+    # Body text consists of uniformly thin lines. A single thick ink band is
+    # enough evidence that this crop has non-text structure (diagram, chart, ...).
+    line_thickness_ceiling = max(20.0, height * 0.12)
+    if int(run_lengths.max()) > line_thickness_ceiling:
+        return True
+
+    active_rows = int(run_lengths.sum())
+    inactive_fraction = 1.0 - active_rows / height
+    return not inactive_fraction >= 0.15
 
 
 def _count_true_runs_np(values: np.ndarray) -> int:
@@ -1981,9 +1971,6 @@ def extract_page_images(
     layout_model_device: str = "cpu",
     layout_model_score_threshold: float = 0.35,
     detected_refs_by_page: dict[int, list[str]] | None = None,
-    vlm_verify_server: str | None = None,
-    vlm_verify_model: str = "olmocr",
-    vlm_verify_api_key: str | None = None,
 ) -> set[str]:
     """Crop and save figure images referenced in olmocr markdown output.
 
@@ -2066,8 +2053,10 @@ def extract_page_images(
         if right > left and lower > upper:
             crop_img = img.crop((left, upper, right, lower))
             ref_origin = "auto-detected" if filename in auto_detected_filenames else "vlm-ref"
-            if not _vlm_verify_is_figure(crop_img, vlm_verify_server, vlm_verify_model, vlm_verify_api_key):
-                logger.info(f"Skipped non-figure crop {filename} from {pdf_path} page {page_num} ({ref_origin}) per VLM verification")
+            # Only verify VLM-emitted coordinate refs; auto-detected crops already
+            # passed the layout detector's confidence + figure-label check.
+            if ref_origin == "vlm-ref" and not _heuristic_is_figure(crop_img):
+                logger.info(f"Skipped non-figure crop {filename} from {pdf_path} page {page_num} ({ref_origin}) per heuristic verification")
                 junk_filenames.add(filename)
             else:
                 crop_img.save(dest, format="PNG")
@@ -2126,7 +2115,94 @@ def get_markdown_asset_dir(markdown_path: str) -> str:
     return os.path.join(markdown_dir, markdown_stem)
 
 
+def _is_local_source_path(source_file: str) -> bool:
+    return (
+        not source_file.startswith("s3://")
+        and not source_file.startswith("gs://")
+        and not source_file.startswith("weka://")
+        and "::" not in source_file
+    )
+
+
+def _process_markdown_doc(args, doc):
+    """Write the markdown file for a single dolma doc and extract its figure crops.
+
+    Runs after the inference vLLM has been torn down, so the layout detector and
+    any other GPU-resident models can take all of VRAM for the figure stage.
+    """
+    source_file = doc["metadata"]["Source-File"]
+    page_spans = doc.get("attributes", {}).get("pdf_page_numbers")
+    natural_text, page_spans = _qualify_markdown_image_refs_with_page_spans(doc["text"], page_spans)
+    detected_refs_by_page: dict[int, list[str]] | None = None
+
+    markdown_path = get_markdown_path(args.workspace, source_file)
+    markdown_dir = os.path.dirname(markdown_path)
+    markdown_asset_dir = get_markdown_asset_dir(markdown_path)
+    markdown_asset_prefix = os.path.basename(markdown_asset_dir)
+
+    if markdown_path.startswith("s3://"):
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as md_tf:
+            md_tf.write(natural_text)
+            md_tf.flush()
+            md_temp_path = md_tf.name
+
+        try:
+            md_bucket, md_key = parse_s3_path(markdown_path)
+            workspace_s3.upload_file(md_temp_path, md_bucket, md_key)
+        finally:
+            if os.path.exists(md_temp_path):
+                os.unlink(md_temp_path)
+        return
+
+    is_local_source = _is_local_source_path(source_file)
+
+    if is_local_source:
+        canonical_refs_by_page = detect_page_figure_refs(
+            natural_text,
+            source_file,
+            page_spans=page_spans,
+            layout_model_backend=args.figure_layout_backend,
+            layout_model_name=args.figure_layout_model,
+            layout_model_device=args.figure_layout_device,
+            layout_model_score_threshold=args.figure_layout_score_threshold,
+        )
+        natural_text = _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
+        detected_refs_by_page = {page_num: [ref.filename for ref in refs] for page_num, refs in canonical_refs_by_page.items()}
+
+    rendered_markdown_text = _prefix_markdown_image_refs(natural_text, markdown_asset_prefix)
+
+    os.makedirs(markdown_dir, exist_ok=True)
+    with open(markdown_path, "w") as md_f:
+        md_f.write(rendered_markdown_text)
+
+    if is_local_source:
+        try:
+            junk_filenames = extract_page_images(
+                natural_text,
+                markdown_asset_dir,
+                source_file,
+                page_spans=page_spans,
+                layout_model_backend=args.figure_layout_backend,
+                layout_model_name=args.figure_layout_model,
+                layout_model_device=args.figure_layout_device,
+                layout_model_score_threshold=args.figure_layout_score_threshold,
+                detected_refs_by_page=detected_refs_by_page,
+            )
+            if junk_filenames:
+                cleaned_markdown = _strip_junk_figure_refs(rendered_markdown_text, junk_filenames)
+                if cleaned_markdown != rendered_markdown_text:
+                    with open(markdown_path, "w") as md_f:
+                        md_f.write(cleaned_markdown)
+                    logger.info(f"Removed {len(junk_filenames)} junk figure ref(s) from {markdown_path}")
+        except Exception as img_err:
+            logger.warning(f"Image extraction failed for {source_file}: {img_err}")
+
+
 async def worker(args, work_queue: WorkQueue, worker_id):
+    """Drains the work queue against the vLLM server and returns the produced
+    dolma docs so main() can run markdown post-processing after vLLM teardown.
+    """
+    pending_markdown_docs: list[dict] = []
     while True:
 
         work_item = await work_queue.get_work()
@@ -2193,91 +2269,10 @@ async def worker(args, work_queue: WorkQueue, worker_id):
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
-            # If --markdown flag is set, also write the natural text to markdown files
+            # Defer markdown writing + figure extraction until after vLLM teardown,
+            # so the layout detector and crop pipeline can use freed GPU memory.
             if args.markdown:
-                logger.info(f"Writing {len(dolma_docs)} markdown files for {work_item.hash}")
-                for doc in dolma_docs:
-                    source_file = doc["metadata"]["Source-File"]
-                    page_spans = doc.get("attributes", {}).get("pdf_page_numbers")
-                    natural_text, page_spans = _qualify_markdown_image_refs_with_page_spans(doc["text"], page_spans)
-                    detected_refs_by_page: dict[int, list[str]] | None = None
-
-                    markdown_path = get_markdown_path(args.workspace, source_file)
-                    markdown_dir = os.path.dirname(markdown_path)
-                    markdown_asset_dir = get_markdown_asset_dir(markdown_path)
-                    markdown_asset_prefix = os.path.basename(markdown_asset_dir)
-
-                    # Create the directory structure if it doesn't exist
-                    if markdown_path.startswith("s3://"):
-                        # For S3 paths, we'll create a temporary file and upload it
-                        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as md_tf:
-                            md_tf.write(natural_text)
-                            md_tf.flush()
-                            md_temp_path = md_tf.name
-
-                        try:
-                            md_bucket, md_key = parse_s3_path(markdown_path)
-                            workspace_s3.upload_file(md_temp_path, md_bucket, md_key)
-                        finally:
-                            # Make sure to clean up the temporary file even if upload fails
-                            if os.path.exists(md_temp_path):
-                                os.unlink(md_temp_path)
-                    else:
-                        if (
-                            not source_file.startswith("s3://")
-                            and not source_file.startswith("gs://")
-                            and not source_file.startswith("weka://")
-                            and "::" not in source_file
-                        ):
-                            canonical_refs_by_page = detect_page_figure_refs(
-                                natural_text,
-                                source_file,
-                                page_spans=page_spans,
-                                layout_model_backend=args.figure_layout_backend,
-                                layout_model_name=args.figure_layout_model,
-                                layout_model_device=args.figure_layout_device,
-                                layout_model_score_threshold=args.figure_layout_score_threshold,
-                            )
-                            natural_text = _rewrite_markdown_with_detected_refs(natural_text, page_spans, canonical_refs_by_page)
-                            detected_refs_by_page = {page_num: [ref.filename for ref in refs] for page_num, refs in canonical_refs_by_page.items()}
-
-                        rendered_markdown_text = _prefix_markdown_image_refs(natural_text, markdown_asset_prefix)
-
-                        # For local paths, create the directory structure and write the file
-                        os.makedirs(markdown_dir, exist_ok=True)
-                        with open(markdown_path, "w") as md_f:
-                            md_f.write(rendered_markdown_text)
-
-                        # Extract figure images when the source PDF is also local
-                        if (
-                            not source_file.startswith("s3://")
-                            and not source_file.startswith("gs://")
-                            and not source_file.startswith("weka://")
-                            and "::" not in source_file
-                        ):
-                            try:
-                                junk_filenames = extract_page_images(
-                                    natural_text,
-                                    markdown_asset_dir,
-                                    source_file,
-                                    page_spans=page_spans,
-                                    layout_model_backend=args.figure_layout_backend,
-                                    layout_model_name=args.figure_layout_model,
-                                    layout_model_device=args.figure_layout_device,
-                                    layout_model_score_threshold=args.figure_layout_score_threshold,
-                                    detected_refs_by_page=detected_refs_by_page,
-                                    vlm_verify_server=args.server,
-                                    vlm_verify_model=args.model,
-                                    vlm_verify_api_key=getattr(args, "api_key", None),
-                                )
-                                if junk_filenames:
-                                    cleaned_markdown = _strip_junk_figure_refs(rendered_markdown_text, junk_filenames)
-                                    if cleaned_markdown != rendered_markdown_text:
-                                        with open(markdown_path, "w") as md_f:
-                                            md_f.write(cleaned_markdown)
-                                        logger.info(f"Removed {len(junk_filenames)} junk figure ref(s) from {markdown_path}")
-                            except Exception as img_err:
-                                logger.warning(f"Image extraction failed for {source_file}: {img_err}")
+                pending_markdown_docs.extend(dolma_docs)
 
             # Update finished token counts from successful documents
             metrics.add_metrics(
@@ -2288,6 +2283,8 @@ async def worker(args, work_queue: WorkQueue, worker_id):
             await work_queue.mark_done(work_item)
         except Exception as e:
             logger.exception(f"Exception occurred while processing work_hash {work_item.hash}: {e}")
+
+    return pending_markdown_docs
 
 
 async def vllm_server_task(model_name_or_path, args, unknown_args=None):
@@ -2970,19 +2967,36 @@ async def main():
         task = asyncio.create_task(worker(args, work_queue, worker_id=i))
         worker_tasks.append(task)
 
-    # Wait for all worker tasks to finish
-    await asyncio.gather(*worker_tasks)
+    # Wait for all worker tasks to finish; each returns the docs it queued for
+    # markdown post-processing.
+    worker_results = await asyncio.gather(*worker_tasks)
+    pending_markdown_docs: list[dict] = [doc for sub in worker_results for doc in sub]
 
-    # Cancel vLLM server if it was started
+    # Tear down the inference vLLM before the figure stage so its VRAM is released
+    # for the layout detector and image post-processing.
     if vllm_server is not None:
         vllm_server.cancel()
-    metrics_task.cancel()
+        await asyncio.gather(vllm_server, return_exceptions=True)
+        try:
+            import torch
 
-    # Wait for cancelled tasks to complete
-    tasks_to_wait = [metrics_task]
-    if vllm_server is not None:
-        tasks_to_wait.append(vllm_server)  # type: ignore
-    await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+    # Run markdown writing + figure extraction now that the inference VLM is gone.
+    if args.markdown and pending_markdown_docs:
+        logger.info(f"Running markdown post-processing for {len(pending_markdown_docs)} document(s)")
+        for doc in pending_markdown_docs:
+            try:
+                _process_markdown_doc(args, doc)
+            except Exception as md_err:
+                source_file = doc.get("metadata", {}).get("Source-File", "<unknown>")
+                logger.exception(f"Markdown post-processing failed for {source_file}: {md_err}")
+
+    metrics_task.cancel()
+    await asyncio.gather(metrics_task, return_exceptions=True)
 
     # Output final metrics summary
     metrics_summary = metrics.get_metrics_summary()
