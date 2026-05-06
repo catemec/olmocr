@@ -2116,12 +2116,7 @@ def get_markdown_asset_dir(markdown_path: str) -> str:
 
 
 def _is_local_source_path(source_file: str) -> bool:
-    return (
-        not source_file.startswith("s3://")
-        and not source_file.startswith("gs://")
-        and not source_file.startswith("weka://")
-        and "::" not in source_file
-    )
+    return not source_file.startswith("s3://") and not source_file.startswith("gs://") and not source_file.startswith("weka://") and "::" not in source_file
 
 
 def _process_markdown_doc(args, doc):
@@ -2288,8 +2283,20 @@ async def worker(args, work_queue: WorkQueue, worker_id):
 
 
 async def vllm_server_task(model_name_or_path, args, unknown_args=None):
+    vllm_executable = shutil.which("vllm")
+    if not vllm_executable:
+        # Fallback for environments where PATH is missing but the active Python env is correct.
+        venv_vllm = os.path.join(os.path.dirname(sys.executable), "vllm")
+        if os.path.isfile(venv_vllm) and os.access(venv_vllm, os.X_OK):
+            vllm_executable = venv_vllm
+
+    if not vllm_executable:
+        raise FileNotFoundError(
+            "Could not find 'vllm' executable. Install vllm in the active environment " "or ensure PATH includes the environment bin directory."
+        )
+
     cmd = [
-        "vllm",
+        vllm_executable,
         "serve",
         model_name_or_path,
         "--port",
@@ -2409,12 +2416,18 @@ async def vllm_server_host(model_name_or_path, args, unknown_args=None):
         sys.exit(1)
 
 
-async def vllm_server_ready(args):
+async def vllm_server_ready(args, server_task=None):
     max_attempts = args.max_server_ready_timeout
     delay_sec = 1
     url = f"{args.server.rstrip('/')}/models"
 
     for attempt in range(1, max_attempts + 1):
+        if server_task is not None and server_task.done():
+            error = server_task.exception()
+            if error is not None:
+                raise RuntimeError("vllm server task exited before becoming ready.") from error
+            raise RuntimeError("vllm server task exited before becoming ready.")
+
         try:
             headers = {}
             if args.server and hasattr(args, "api_key") and args.api_key:
@@ -2652,8 +2665,7 @@ def print_stats(args, root_work_queue):
             all_processed.update(paths)
 
     d, p, o, c = totals["docs"], totals["pages"], totals["output_tokens"], max(1, completed_items)
-    print(
-        f"""
+    print(f"""
 Work Items Status:
 Total work items: {total_items:,}
 Completed items: {completed_items:,}
@@ -2677,8 +2689,7 @@ Total tokens in long context documents: {totals['long_tokens']:,}
 
 English-only documents (>50% pages with 'en'): {totals['en_docs']:,}
 Total output tokens in English-only documents: {totals['en_tokens']:,}
-Projected English-only output tokens: {round(totals['en_tokens'] / c * total_items):,}"""
-    )
+Projected English-only output tokens: {round(totals['en_tokens'] / c * total_items):,}""")
 
 
 async def main():
@@ -2957,7 +2968,13 @@ async def main():
     if use_internal_server:
         vllm_server = asyncio.create_task(vllm_server_host(model_name_or_path, args, unknown_args))
 
-    await vllm_server_ready(args)
+    try:
+        await vllm_server_ready(args, vllm_server)
+    except Exception:
+        if vllm_server is not None:
+            vllm_server.cancel()
+            await asyncio.gather(vllm_server, return_exceptions=True)
+        raise
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
