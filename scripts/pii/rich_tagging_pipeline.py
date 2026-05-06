@@ -576,7 +576,6 @@ async def server_task(model_name_or_path, args, semaphore):
         str(SERVER_PORT),
         "--uvicorn-log-level",
         "warning",
-        "--disable-log-requests",
         "--max-model-len",
         "16000",
         # "--hf_overrides",  "{\"architectures\": [\"Gemma3ForCausalLM\"]}",

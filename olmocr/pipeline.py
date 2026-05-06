@@ -2301,7 +2301,6 @@ async def vllm_server_task(model_name_or_path, args, unknown_args=None):
         model_name_or_path,
         "--port",
         str(args.port),
-        "--disable-log-requests",
         "--uvicorn-log-level",
         "warning",
         "--served-model-name",
