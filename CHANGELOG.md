@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Upgraded `[gpu]` extras: `vllm` 0.11.2 → 0.20.1, `torch` `>=2.7.0` → `==2.11.0` (CUDA 13). Pinned previously-loose `doclayout-yolo==0.0.4` and `timm==1.0.26` to prevent dependency drift.
+- Aligned `[train]` extras to pin `torch==2.11.0` and `torchvision==0.26.0` to match `[gpu]`.
+
+### Upgrade notes
+- A clean reinstall of `[gpu]` is required. Existing environments may carry orphaned `nvidia-*-cu12` packages from the previous torch 2.9 / vllm 0.11 stack; remove them so torch 2.11.0 loads the correct CUDA 13 NCCL. `xformers` is also no longer a vllm dependency and can be uninstalled.
+
 ## [v0.4.27](https://github.com/allenai/olmocr/releases/tag/v0.4.27) - 2026-03-12
 
 ## [v0.4.26](https://github.com/allenai/olmocr/releases/tag/v0.4.26) - 2026-03-06

@@ -51,11 +51,11 @@ olmocr = "olmocr.pipeline:cli_main"
 
 [project.optional-dependencies]
 gpu = [
-    "torch>=2.7.0",
+    "torch==2.11.0",
     "transformers==4.57.3",
-    "doclayout-yolo",
-    "timm",
-    "vllm==0.11.2"
+    "doclayout-yolo==0.0.4",
+    "timm==1.0.26",
+    "vllm==0.20.1"
 ]
 
 beaker = [
@@ -108,8 +108,8 @@ bench = [
 ]
 
 train = [
-    "torch",
-    "torchvision",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "accelerate",
     "trl",
     "peft",
