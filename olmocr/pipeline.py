@@ -658,7 +658,10 @@ def build_dolma_document(pdf_orig_path, page_results):
 
 _IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
 _MARKDOWN_IMAGE_TAG_RE = re.compile(r"!\[([^\]]*)\]\((page_(?:\d+_)?\d+_\d+_\d+_\d+\.png)\)")
-_FIGURE_CAPTION_RE = re.compile(r"(?m)^\s*Figure\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_FIGURE_CAPTION_RE = re.compile(
+    r"(?m)^\s*(?:Figure|Fig\.?|Map|Plate|Ill\.?|Illustration|Table)\s+(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
